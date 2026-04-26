@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        runner:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: cachix/install-nix-action@v31
+
+      # Set up the binary cache (substituter + signing key + post-build hook)
+      # before any nix builds run. binary-path doesn't have to exist yet — the
+      # post step at end of job will run it after `nix build` materializes
+      # result/.
+      - uses: ./
+        with:
+          bucket: testquorum-nix-public
+          s3-endpoint: ba58a56742691d9efc310cca51093d04.r2.cloudflarestorage.com
+          region: auto
+          aws-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          public-key: "nixcache.testquorum.dev-1:aS+CJF8O8Ebirc6hypMfq/061h5TJlbsej1+zUJHPec="
+          private-key: ${{ secrets.NIX_SIGNING_KEY }}
+          binary-path: result/bin/nix-s3-generations
+
+      - name: Nix fast build
+        run: nix run .#nix-fast-build -- --no-nom
+
+      - name: Build Rust binary
+        run: nix build .
+
+      - name: Export Nix closure archive
+        run: |
+          nix-store --export $(nix-store -qR result) | zstd -19 > nix-s3-generations-closure-$(uname -m)-$(uname -s).closure.zst
+
+      - name: Upload closure to R2
+        if: github.event_name == 'push'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          aws s3 cp \
+            nix-s3-generations-closure-$(uname -m)-$(uname -s).closure.zst \
+            s3://testquorum-assets/binaries/nix-s3-generations/${{ github.sha }}/nix-s3-generations-closure-$(uname -m)-$(uname -s).closure.zst \
+            --endpoint-url https://ba58a56742691d9efc310cca51093d04.r2.cloudflarestorage.com
