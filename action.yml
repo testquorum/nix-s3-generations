@@ -1,0 +1,37 @@
+name: "Nix S3 Generations Push"
+description: "Push Nix store paths to an S3-backed generations cache"
+inputs:
+  s3-endpoint:
+    description: "S3 endpoint URL"
+    required: true
+  bucket:
+    description: "S3 bucket name for the cache"
+    required: true
+  public-key:
+    description: "Public key for the cache"
+    required: true
+  private-key:
+    description: "Private key for signing uploads"
+    required: true
+  region:
+    description: "AWS region"
+    required: false
+  aws-access-key-id:
+    description: "AWS access key ID. Falls back to AWS_ACCESS_KEY_ID env var."
+    required: false
+  aws-secret-access-key:
+    description: "AWS secret access key. Falls back to AWS_SECRET_ACCESS_KEY env var."
+    required: false
+  binary-path:
+    description: "Path to a local nix-s3-generations binary. When set, skips downloading from binary-base-url."
+    required: false
+  binary-base-url:
+    description: "Base URL for downloading the nix-s3-generations binary closure"
+    required: false
+  version:
+    description: "Version of the nix-s3-generations binary to download"
+    required: false
+runs:
+  using: "node24"
+  main: "./dist/index.js"
+  post: "./dist/index.js"
