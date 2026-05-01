@@ -19,10 +19,12 @@ jobs:
 
       - uses: cachix/install-nix-action@v31
 
-      # Set up the binary cache (substituter + signing key + post-build hook)
-      # before any nix builds run. binary-path doesn't have to exist yet — the
-      # post step at end of job will run it after `nix build` materializes
-      # result/.
+      # Configure the binary cache (substituter + signing key + post-build
+      # hook) before any nix builds run. No closure has been published for
+      # *this* commit yet (this run is what publishes it), so the action's
+      # main phase 404s against R2 and falls back to building the binary
+      # from the on-disk checkout. The later `nix-fast-build` and export
+      # steps just reuse that already-built store path.
       - uses: ./
         with:
           bucket: testquorum-nix-public
@@ -32,17 +34,15 @@ jobs:
           aws-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           public-key: "nixcache.testquorum.dev-1:aS+CJF8O8Ebirc6hypMfq/061h5TJlbsej1+zUJHPec="
           private-key: ${{ secrets.NIX_SIGNING_KEY }}
-          binary-path: result/bin/nix-s3-generations
 
       - name: Nix fast build
         run: nix run .#nix-fast-build -- --no-nom
 
-      - name: Build Rust binary
-        run: nix build .
-
       - name: Export Nix closure archive
         run: |
-          nix-store --export $(nix-store -qR result) | zstd -19 > nix-s3-generations-closure-$(uname -m)-$(uname -s).closure.zst
+          artifact=nix-s3-generations-closure-$(uname -m)-$(uname -s).closure.zst
+          storepath=$(nix build --no-link --print-out-paths .)
+          nix-store --export $(nix-store -qR "$storepath") | zstd -19 > "$artifact"
 
       - name: Upload closure to R2
         if: github.event_name == 'push'
