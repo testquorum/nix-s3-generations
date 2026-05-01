@@ -33663,10 +33663,10 @@ function getIDToken(aud) {
 //# sourceMappingURL=core.js.map
 ;// CONCATENATED MODULE: external "node:fs"
 const external_node_fs_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:fs");
-;// CONCATENATED MODULE: external "node:os"
-const external_node_os_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:os");
 ;// CONCATENATED MODULE: external "node:path"
 const external_node_path_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:path");
+// EXTERNAL MODULE: external "node:url"
+var external_node_url_ = __nccwpck_require__(3136);
 // EXTERNAL MODULE: ./node_modules/semver/index.js
 var node_modules_semver = __nccwpck_require__(2088);
 ;// CONCATENATED MODULE: ./node_modules/@actions/tool-cache/lib/manifest.js
@@ -34467,6 +34467,8 @@ function _unique(values) {
     return Array.from(new Set(values));
 }
 //# sourceMappingURL=tool-cache.js.map
+;// CONCATENATED MODULE: external "node:os"
+const external_node_os_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:os");
 ;// CONCATENATED MODULE: ./action/helpers.ts
 
 
@@ -34687,6 +34689,14 @@ async function helpers_downloadTool(url) {
 
 
 
+
+/**
+ * True when the error came from `tc.downloadTool` for a URL that returned 404.
+ * Used by callers to distinguish "ref not published" from a transient failure.
+ */
+function is404Error(err) {
+    return err instanceof HTTPError && err.httpStatusCode === 404;
+}
 function detectPlatform() {
     const arch = external_node_os_namespaceObject.machine();
     const sys = external_node_os_namespaceObject.type();
@@ -34752,6 +34762,7 @@ async function unpackClosure(artifactPath, binName) {
 
 
 
+
 const STATE_STARTED = "STATE_STARTED";
 const STATE_STORE_SNAPSHOT = "STATE_STORE_SNAPSHOT";
 const STATE_ERROR_IN_MAIN = "STATE_ERROR_IN_MAIN";
@@ -34762,41 +34773,67 @@ const DEFAULT_REGION = "us-east-1";
 function resolveCredential(inputName, envName) {
     return getInput(inputName) || process.env[envName] || "";
 }
+/// Build the binary from the action's on-disk checkout. GITHUB_ACTION_PATH
+/// is composite-action-only and unset for JS actions, so we locate the root
+/// via the running script: `dist/index.js` after ncc bundling sits one level
+/// below the action root.
+async function buildBinaryFromCheckout() {
+    const root = external_node_path_namespaceObject.resolve(external_node_path_namespaceObject.dirname((0,external_node_url_.fileURLToPath)(import.meta.url)), "..");
+    info(`Falling back to local build from ${root}`);
+    let storePath = "";
+    await exec_exec("nix", ["build", "--no-link", "--no-write-lock-file", "--print-out-paths", root], {
+        listeners: {
+            stdout: (data) => {
+                storePath += data.toString();
+            },
+        },
+    });
+    return external_node_path_namespaceObject.join(storePath.trim(), "bin", "nix-s3-generations");
+}
 async function mainPhase() {
     const bucket = getInput("bucket", { required: true });
     const region = getInput("region") || DEFAULT_REGION;
     const endpoint = getInput("s3-endpoint", { required: true });
     const publicKey = getInput("public-key", { required: true });
     const signingKey = getInput("private-key", { required: true });
-    const binaryPath = getInput("binary-path");
     const baseUrl = getInput("binary-base-url") || DEFAULT_BASE_URL;
-    const version = getInput("version") || process.env["GITHUB_ACTION_REF"] || "";
+    const versionInput = getInput("version");
+    const version = versionInput || process.env["GITHUB_ACTION_REF"] || "";
     const accessKeyId = resolveCredential("aws-access-key-id", "AWS_ACCESS_KEY_ID");
     const secretAccessKey = resolveCredential("aws-secret-access-key", "AWS_SECRET_ACCESS_KEY");
     if (!accessKeyId || !secretAccessKey) {
         throw new Error("nix-s3-generations: AWS credentials not provided. Set aws-access-key-id and aws-secret-access-key inputs, or AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY env vars.");
     }
-    let binPath;
-    if (binaryPath) {
-        info(`Using local binary at ${binaryPath}`);
-        binPath = binaryPath;
-    }
-    else {
-        if (!version) {
-            throw new Error("nix-s3-generations: 'version' input is required when not using 'binary-path' (or set GITHUB_ACTION_REF)");
-        }
-        const platform = detectPlatform();
-        info(`Detected platform: ${platform}`);
-        const artifactPath = await fetchArtifact(platform, version, baseUrl);
-        binPath = await unpackClosure(artifactPath, "nix-s3-generations");
-    }
-    info(`Binary available at: ${binPath}`);
-    saveState(STATE_BIN_PATH, binPath);
+    // Configure the cache before resolving the binary so the fallback build
+    // benefits from the substituter and its outputs hit the post-build hook.
     await configureNixCache({ bucket, region, endpoint, publicKey }, {
         accessKeyId,
         secretAccessKey,
         region,
     }, signingKey);
+    let binPath;
+    if (!version) {
+        binPath = await buildBinaryFromCheckout();
+    }
+    else {
+        const platform = detectPlatform();
+        info(`Detected platform: ${platform}`);
+        try {
+            const artifactPath = await fetchArtifact(platform, version, baseUrl);
+            binPath = await unpackClosure(artifactPath, "nix-s3-generations");
+        }
+        catch (error) {
+            // Only fall back when version came from GITHUB_ACTION_REF — an explicit
+            // `version` input must fail loudly on 404, not silently substitute a
+            // different binary.
+            if (versionInput || !is404Error(error)) {
+                throw error;
+            }
+            binPath = await buildBinaryFromCheckout();
+        }
+    }
+    info(`Binary available at: ${binPath}`);
+    saveState(STATE_BIN_PATH, binPath);
     // Pin `--json-format 1` so the output shape is the same `{path: meta}` map
     // regardless of the installed Nix version's default. Some Nix versions
     // default to format 2 which wraps entries under `paths`, which the binary's

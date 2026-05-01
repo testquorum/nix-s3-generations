@@ -1,9 +1,18 @@
 import * as core from "@actions/core";
 import * as exec from "@actions/exec";
+import * as tc from "@actions/tool-cache";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { downloadTool } from "./helpers.js";
+
+/**
+ * True when the error came from `tc.downloadTool` for a URL that returned 404.
+ * Used by callers to distinguish "ref not published" from a transient failure.
+ */
+export function is404Error(err: unknown): boolean {
+  return err instanceof tc.HTTPError && err.httpStatusCode === 404;
+}
 
 export function detectPlatform(): string {
   const arch = os.machine();

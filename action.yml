@@ -22,9 +22,6 @@ inputs:
   aws-secret-access-key:
     description: "AWS secret access key. Falls back to AWS_SECRET_ACCESS_KEY env var."
     required: false
-  binary-path:
-    description: "Path to a local nix-s3-generations binary. When set, skips downloading from binary-base-url."
-    required: false
   binary-base-url:
     description: "Base URL for downloading the nix-s3-generations binary closure"
     required: false

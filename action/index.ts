@@ -1,13 +1,15 @@
 import * as core from "@actions/core";
 import * as exec from "@actions/exec";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   detectPlatform,
   fetchArtifact,
+  is404Error,
   unpackClosure,
 } from "./binary-download.js";
 import { configureNixCache, makeTempDir, runPost } from "./helpers.js";
-import * as fs from "node:fs";
-import * as path from "node:path";
 
 export const STATE_STARTED = "STATE_STARTED";
 export const STATE_STORE_SNAPSHOT = "STATE_STORE_SNAPSHOT";
@@ -24,16 +26,37 @@ function resolveCredential(inputName: string, envName: string): string {
   return core.getInput(inputName) || process.env[envName] || "";
 }
 
+/// Build the binary from the action's on-disk checkout. GITHUB_ACTION_PATH
+/// is composite-action-only and unset for JS actions, so we locate the root
+/// via the running script: `dist/index.js` after ncc bundling sits one level
+/// below the action root.
+async function buildBinaryFromCheckout(): Promise<string> {
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  core.info(`Falling back to local build from ${root}`);
+  let storePath = "";
+  await exec.exec(
+    "nix",
+    ["build", "--no-link", "--no-write-lock-file", "--print-out-paths", root],
+    {
+      listeners: {
+        stdout: (data: Buffer) => {
+          storePath += data.toString();
+        },
+      },
+    },
+  );
+  return path.join(storePath.trim(), "bin", "nix-s3-generations");
+}
+
 export async function mainPhase(): Promise<void> {
   const bucket = core.getInput("bucket", { required: true });
   const region = core.getInput("region") || DEFAULT_REGION;
   const endpoint = core.getInput("s3-endpoint", { required: true });
   const publicKey = core.getInput("public-key", { required: true });
   const signingKey = core.getInput("private-key", { required: true });
-  const binaryPath = core.getInput("binary-path");
   const baseUrl = core.getInput("binary-base-url") || DEFAULT_BASE_URL;
-  const version =
-    core.getInput("version") || process.env["GITHUB_ACTION_REF"] || "";
+  const versionInput = core.getInput("version");
+  const version = versionInput || process.env["GITHUB_ACTION_REF"] || "";
 
   const accessKeyId = resolveCredential(
     "aws-access-key-id",
@@ -49,25 +72,8 @@ export async function mainPhase(): Promise<void> {
     );
   }
 
-  let binPath: string;
-  if (binaryPath) {
-    core.info(`Using local binary at ${binaryPath}`);
-    binPath = binaryPath;
-  } else {
-    if (!version) {
-      throw new Error(
-        "nix-s3-generations: 'version' input is required when not using 'binary-path' (or set GITHUB_ACTION_REF)",
-      );
-    }
-    const platform = detectPlatform();
-    core.info(`Detected platform: ${platform}`);
-
-    const artifactPath = await fetchArtifact(platform, version, baseUrl);
-    binPath = await unpackClosure(artifactPath, "nix-s3-generations");
-  }
-  core.info(`Binary available at: ${binPath}`);
-  core.saveState(STATE_BIN_PATH, binPath);
-
+  // Configure the cache before resolving the binary so the fallback build
+  // benefits from the substituter and its outputs hit the post-build hook.
   await configureNixCache(
     { bucket, region, endpoint, publicKey },
     {
@@ -77,6 +83,28 @@ export async function mainPhase(): Promise<void> {
     },
     signingKey,
   );
+
+  let binPath: string;
+  if (!version) {
+    binPath = await buildBinaryFromCheckout();
+  } else {
+    const platform = detectPlatform();
+    core.info(`Detected platform: ${platform}`);
+    try {
+      const artifactPath = await fetchArtifact(platform, version, baseUrl);
+      binPath = await unpackClosure(artifactPath, "nix-s3-generations");
+    } catch (error) {
+      // Only fall back when version came from GITHUB_ACTION_REF — an explicit
+      // `version` input must fail loudly on 404, not silently substitute a
+      // different binary.
+      if (versionInput || !is404Error(error)) {
+        throw error;
+      }
+      binPath = await buildBinaryFromCheckout();
+    }
+  }
+  core.info(`Binary available at: ${binPath}`);
+  core.saveState(STATE_BIN_PATH, binPath);
 
   // Pin `--json-format 1` so the output shape is the same `{path: meta}` map
   // regardless of the installed Nix version's default. Some Nix versions

@@ -1,11 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import * as core from "@actions/core";
 import * as exec from "@actions/exec";
+import * as tc from "@actions/tool-cache";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import {
   detectPlatform,
   fetchArtifact,
+  is404Error,
   unpackClosure,
 } from "../binary-download.js";
 
@@ -85,6 +87,26 @@ describe("fetchArtifact", () => {
     expect(downloadTool).toHaveBeenCalledWith(
       "https://assets.example.com/binaries/foo/v1/nix-s3-generations-closure-aarch64-Linux.closure.zst",
     );
+  });
+});
+
+describe("is404Error", () => {
+  it("matches HTTPError with status 404", () => {
+    const err = new tc.HTTPError(404);
+    expect(is404Error(err)).toBe(true);
+  });
+
+  it("rejects HTTPError with other statuses", () => {
+    expect(is404Error(new tc.HTTPError(403))).toBe(false);
+    expect(is404Error(new tc.HTTPError(500))).toBe(false);
+    expect(is404Error(new tc.HTTPError(undefined))).toBe(false);
+  });
+
+  it("rejects unrelated errors and non-error values", () => {
+    expect(is404Error(new Error("nope"))).toBe(false);
+    expect(is404Error("404")).toBe(false);
+    expect(is404Error(undefined)).toBe(false);
+    expect(is404Error(null)).toBe(false);
   });
 });
 
