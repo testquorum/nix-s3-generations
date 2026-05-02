@@ -50,7 +50,8 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: |
+          ref="${{ github.ref_type == 'tag' && github.ref_name || github.sha }}"
           aws s3 cp \
             nix-s3-generations-closure-$(uname -m)-$(uname -s).closure.zst \
-            s3://testquorum-assets/binaries/nix-s3-generations/${{ github.sha }}/nix-s3-generations-closure-$(uname -m)-$(uname -s).closure.zst \
+            "s3://testquorum-assets/binaries/nix-s3-generations/${ref}/nix-s3-generations-closure-$(uname -m)-$(uname -s).closure.zst" \
             --endpoint-url https://ba58a56742691d9efc310cca51093d04.r2.cloudflarestorage.com
