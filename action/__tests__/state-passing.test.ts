@@ -1,5 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import * as core from "@actions/core";
+import * as exec from "@actions/exec";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import * as os from "node:os";
 import {
   main,
   STATE_STARTED,
@@ -8,7 +12,13 @@ import {
 } from "../index.js";
 
 vi.mock("@actions/core");
-vi.mock("@actions/exec");
+vi.mock("@actions/exec", () => ({
+  exec: vi.fn(async (_cmd: string, _args?: string[], options?: any) => {
+    const data = Buffer.from("{}");
+    options?.listeners?.stdout?.(data);
+    return 0;
+  }),
+}));
 vi.mock("../binary-download.js", () => ({
   detectPlatform: vi.fn(() => "x86_64-Linux"),
   fetchArtifact: vi.fn(async () => "/tmp/artifact.closure.zst"),
@@ -19,6 +29,9 @@ vi.mock("../binary-download.js", () => ({
 vi.mock("../helpers.js", () => ({
   runPost: vi.fn(async () => {}),
   configureNixCache: vi.fn(async () => {}),
+  makeTempDir: vi.fn((prefix: string) => {
+    return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  }),
 }));
 
 describe("state passing", () => {
@@ -80,7 +93,7 @@ describe("state passing", () => {
 
     expect(core.saveState).toHaveBeenCalledWith(
       STATE_STORE_SNAPSHOT,
-      expect.any(String),
+      expect.stringContaining("store-snapshot.json"),
     );
   });
 
@@ -122,6 +135,7 @@ describe("state passing", () => {
     expect(stateStore.get(STATE_STARTED)).toBe("true");
     const savedSnapshot = stateStore.get(STATE_STORE_SNAPSHOT);
     expect(savedSnapshot).toBeDefined();
+    expect(savedSnapshot).toContain("store-snapshot.json");
 
     stateStore.set(STATE_STARTED, "true");
     stateStore.set(
@@ -155,5 +169,84 @@ describe("state passing", () => {
     expect(core.setFailed).toHaveBeenCalledWith(
       expect.stringContaining("AWS credentials"),
     );
+  });
+
+  it("runPost fails with descriptive error when snapshot file is missing", async () => {
+    const { runPost } = await vi.importActual<{ runPost: () => Promise<void> }>(
+      "../helpers.js",
+    );
+    stateStore.set(
+      STATE_STORE_SNAPSHOT,
+      "/tmp/nonexistent-snapshot-12345/store-snapshot.json",
+    );
+    stateStore.set(
+      STATE_BIN_PATH,
+      "/nix/store/xxx-nix-s3-generations/bin/nix-s3-generations",
+    );
+
+    await runPost();
+
+    expect(core.setFailed).toHaveBeenCalledWith(
+      expect.stringContaining("snapshot file not found"),
+    );
+  });
+
+  it("runPost fails when snapshot state is empty", async () => {
+    const { runPost } = await vi.importActual<{ runPost: () => Promise<void> }>(
+      "../helpers.js",
+    );
+    stateStore.set(STATE_STORE_SNAPSHOT, "");
+    stateStore.set(
+      STATE_BIN_PATH,
+      "/nix/store/xxx-nix-s3-generations/bin/nix-s3-generations",
+    );
+
+    await runPost();
+
+    expect(core.setFailed).toHaveBeenCalledWith(
+      expect.stringContaining("snapshot path not found"),
+    );
+  });
+
+  it("runPost cleans up snapshot dir on success", async () => {
+    const { runPost } = await vi.importActual<{ runPost: () => Promise<void> }>(
+      "../helpers.js",
+    );
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "test-snapshot-"));
+    const snapshotPath = path.join(tmpDir, "store-snapshot.json");
+    fs.writeFileSync(snapshotPath, "{}");
+
+    stateStore.set(STATE_STORE_SNAPSHOT, snapshotPath);
+    stateStore.set(
+      STATE_BIN_PATH,
+      "/nix/store/xxx-nix-s3-generations/bin/nix-s3-generations",
+    );
+
+    vi.mocked(exec.exec).mockResolvedValue(0);
+
+    await runPost();
+
+    expect(fs.existsSync(tmpDir)).toBe(false);
+  });
+
+  it("runPost cleans up snapshot dir on binary failure", async () => {
+    const { runPost } = await vi.importActual<{ runPost: () => Promise<void> }>(
+      "../helpers.js",
+    );
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "test-snapshot-"));
+    const snapshotPath = path.join(tmpDir, "store-snapshot.json");
+    fs.writeFileSync(snapshotPath, "{}");
+
+    stateStore.set(STATE_STORE_SNAPSHOT, snapshotPath);
+    stateStore.set(
+      STATE_BIN_PATH,
+      "/nix/store/xxx-nix-s3-generations/bin/nix-s3-generations",
+    );
+
+    vi.mocked(exec.exec).mockResolvedValue(1);
+
+    await runPost();
+
+    expect(fs.existsSync(tmpDir)).toBe(false);
   });
 });

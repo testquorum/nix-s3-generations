@@ -152,8 +152,22 @@ export async function runPost(): Promise<void> {
     return;
   }
 
-  const preSnapshot = core.getState(STATE_STORE_SNAPSHOT);
+  const preSnapshotPath = core.getState(STATE_STORE_SNAPSHOT);
   const binPath = core.getState(STATE_BIN_PATH);
+
+  if (!preSnapshotPath) {
+    core.setFailed("nix-s3-generations: snapshot path not found in state");
+    return;
+  }
+
+  if (!fs.existsSync(preSnapshotPath)) {
+    core.setFailed(
+      `nix-s3-generations: snapshot file not found at ${preSnapshotPath}`,
+    );
+    return;
+  }
+
+  core.info(`Using snapshot file: ${preSnapshotPath}`);
 
   if (!binPath) {
     core.setFailed(
@@ -177,11 +191,6 @@ export async function runPost(): Promise<void> {
     core.getInput("aws-secret-access-key") ||
     process.env["AWS_SECRET_ACCESS_KEY"] ||
     "";
-
-  const tmpDir = makeTempDir("nix-s3-generations-post-");
-  const preSnapshotPath = path.join(tmpDir, "pre-snapshot.json");
-  fs.writeFileSync(preSnapshotPath, preSnapshot || "{}");
-  core.info(`Wrote pre-step snapshot to ${preSnapshotPath}`);
 
   // The GC domain is the {repo}/{workflow} pair: generations are numbered
   // and aged out independently per (repo, workflow). The numeric generation
@@ -237,7 +246,7 @@ export async function runPost(): Promise<void> {
     core.setFailed(
       `nix-s3-generations: failed to execute push binary: ${error instanceof Error ? error.message : String(error)}`,
     );
-    cleanupTempFiles(tmpDir);
+    cleanupTempFiles(path.dirname(preSnapshotPath));
     return;
   }
 
@@ -249,7 +258,7 @@ export async function runPost(): Promise<void> {
     );
   }
 
-  cleanupTempFiles(tmpDir);
+  cleanupTempFiles(path.dirname(preSnapshotPath));
 
   core.info("nix-s3-generations: post phase complete");
 }
