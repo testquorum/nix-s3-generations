@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import * as core from "@actions/core";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -38,6 +38,7 @@ describe("phase detection", () => {
     vi.clearAllMocks();
     process.env["AWS_ACCESS_KEY_ID"] = "test-akid";
     process.env["AWS_SECRET_ACCESS_KEY"] = "test-secret";
+    process.env["GITHUB_ACTION_REF"] = "test-sha";
 
     vi.mocked(core.getInput).mockImplementation(
       (name: string) => inputs[name] ?? "",
@@ -56,6 +57,10 @@ describe("phase detection", () => {
     vi.mocked(core.setFailed).mockImplementation(() => {});
   });
 
+  afterEach(() => {
+    delete process.env["GITHUB_ACTION_REF"];
+  });
+
   describe("main routing", () => {
     it("routes to mainPhase when STATE_STARTED is empty", async () => {
       inputs = {
@@ -64,7 +69,6 @@ describe("phase detection", () => {
         bucket: "my-bucket",
         "s3-endpoint": "abc.r2.cloudflarestorage.com",
         "private-key": "my-key",
-        version: "test-sha",
       };
       stateStore.set(STATE_STARTED, "");
 
@@ -98,7 +102,6 @@ describe("phase detection", () => {
         bucket: "my-bucket",
         "s3-endpoint": "abc.r2.cloudflarestorage.com",
         "private-key": "my-key",
-        version: "test-sha",
       };
       stateStore.set(STATE_STARTED, "");
 
@@ -119,7 +122,6 @@ describe("phase detection", () => {
         bucket: "my-bucket",
         "s3-endpoint": "abc.r2.cloudflarestorage.com",
         "private-key": "my-key",
-        version: "test-sha",
       };
       stateStore.set(STATE_STARTED, "");
 
