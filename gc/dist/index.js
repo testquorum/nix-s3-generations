@@ -30704,16 +30704,6 @@ module.exports = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("util");
 /************************************************************************/
 var __webpack_exports__ = {};
 
-// EXPORTS
-__nccwpck_require__.d(__webpack_exports__, {
-  GB: () => (/* reexport */ STATE_BIN_PATH),
-  x_: () => (/* reexport */ STATE_ERROR_IN_MAIN),
-  Iv: () => (/* reexport */ STATE_STARTED),
-  NQ: () => (/* reexport */ STATE_STORE_SNAPSHOT),
-  iW: () => (/* binding */ main),
-  hb: () => (/* binding */ mainPhase)
-});
-
 ;// CONCATENATED MODULE: external "os"
 const external_os_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("os");
 ;// CONCATENATED MODULE: ./node_modules/@actions/core/lib/utils.js
@@ -30861,16 +30851,16 @@ function file_command_issueFileCommand(command, message) {
     if (!filePath) {
         throw new Error(`Unable to find environment variable for file command ${command}`);
     }
-    if (!external_fs_namespaceObject.existsSync(filePath)) {
+    if (!fs.existsSync(filePath)) {
         throw new Error(`Missing file at path: ${filePath}`);
     }
-    external_fs_namespaceObject.appendFileSync(filePath, `${utils_toCommandValue(message)}${external_os_namespaceObject.EOL}`, {
+    fs.appendFileSync(filePath, `${toCommandValue(message)}${os.EOL}`, {
         encoding: 'utf8'
     });
 }
 function file_command_prepareKeyValueMessage(key, value) {
-    const delimiter = `ghadelimiter_${external_crypto_namespaceObject.randomUUID()}`;
-    const convertedValue = utils_toCommandValue(value);
+    const delimiter = `ghadelimiter_${crypto.randomUUID()}`;
+    const convertedValue = toCommandValue(value);
     // These should realistically never happen, but just in case someone finds a
     // way to exploit uuid generation let's not allow keys or values that contain
     // the delimiter.
@@ -30880,7 +30870,7 @@ function file_command_prepareKeyValueMessage(key, value) {
     if (convertedValue.includes(delimiter)) {
         throw new Error(`Unexpected input: value should not contain the delimiter "${delimiter}"`);
     }
-    return `${key}<<${delimiter}${external_os_namespaceObject.EOL}${convertedValue}${external_os_namespaceObject.EOL}${delimiter}`;
+    return `${key}<<${delimiter}${os.EOL}${convertedValue}${os.EOL}${delimiter}`;
 }
 //# sourceMappingURL=file-command.js.map
 ;// CONCATENATED MODULE: external "path"
@@ -33559,7 +33549,7 @@ function error(message, properties = {}) {
  * @param properties optional properties to add to the annotation.
  */
 function warning(message, properties = {}) {
-    command_issueCommand('warning', utils_toCommandProperties(properties), message instanceof Error ? message.toString() : message);
+    issueCommand('warning', toCommandProperties(properties), message instanceof Error ? message.toString() : message);
 }
 /**
  * Adds a notice issue
@@ -33626,9 +33616,9 @@ function group(name, fn) {
 function saveState(name, value) {
     const filePath = process.env['GITHUB_STATE'] || '';
     if (filePath) {
-        return file_command_issueFileCommand('STATE', file_command_prepareKeyValueMessage(name, value));
+        return issueFileCommand('STATE', prepareKeyValueMessage(name, value));
     }
-    command_issueCommand('save-state', { name }, utils_toCommandValue(value));
+    issueCommand('save-state', { name }, toCommandValue(value));
 }
 /**
  * Gets the value of an state set by this action's main execution.
@@ -34594,176 +34584,51 @@ async function resolveBinary(opts) {
     }
 }
 
-;// CONCATENATED MODULE: ./action/state.ts
-const STATE_STARTED = "STATE_STARTED";
-const STATE_STORE_SNAPSHOT = "STATE_STORE_SNAPSHOT";
-const STATE_ERROR_IN_MAIN = "STATE_ERROR_IN_MAIN";
-const STATE_BIN_PATH = "STATE_BIN_PATH";
-
-;// CONCATENATED MODULE: ./action/helpers.ts
+;// CONCATENATED MODULE: ./action/gc-index.ts
 
 
 
-
-
-
-const NIX_CONF_PATH = "/etc/nix/nix.conf";
-const AWS_CREDENTIALS_PATH = "/root/.aws/credentials";
-const SIGNING_KEY_PATH = "/etc/nix/cache-priv-key.pem";
-// The path is unique to this action so the Rust binary can detect *our*
-// hook (not just any post-build-hook). Must stay in sync with
-// `OUR_POST_BUILD_HOOK_PATH` in src/nix.rs.
-const POST_BUILD_HOOK_PATH = "/etc/nix/nix-s3-generations-post-build-hook.sh";
-/// Substituter URL parameters: encoded as `&`-separated key=value pairs that
-/// follow the bucket name in `s3://{bucket}?...`. Native AWS S3 doesn't need
-/// `endpoint=`; everything else does.
-function buildNixS3Params(cfg) {
-    const isNativeAws = cfg.endpoint === "s3.amazonaws.com" ||
-        /^s3\.[^.]+\.amazonaws\.com$/.test(cfg.endpoint);
-    if (isNativeAws) {
-        return `region=${cfg.region}`;
-    }
-    return `endpoint=${cfg.endpoint}&region=${cfg.region}`;
+const DEFAULT_BASE_URL = "https://assets.testquorum.dev/binaries/nix-s3-generations/";
+const DEFAULT_REGION = "us-east-1";
+function resolveCredential(inputName, envName) {
+    return getInput(inputName) || process.env[envName] || "";
 }
-/// Snippet appended to nix.conf. Leading newline so we don't accidentally
-/// join to a non-newline-terminated last line of the existing file.
-function buildNixConf(cfg) {
-    const s3Params = buildNixS3Params(cfg);
-    return [
-        "",
-        "# nix-s3-generations",
-        `extra-substituters = s3://${cfg.bucket}?${s3Params}`,
-        `extra-trusted-public-keys = ${cfg.publicKey}`,
-        `post-build-hook = ${POST_BUILD_HOOK_PATH}`,
-        "",
-    ].join("\n");
-}
-function buildAwsCredentialsFile(creds) {
-    return [
-        "[default]",
-        `aws_access_key_id = ${creds.accessKeyId}`,
-        `aws_secret_access_key = ${creds.secretAccessKey}`,
-        `region = ${creds.region}`,
-        "",
-    ].join("\n");
-}
-/// Post-build hook script. Runs as root via the Nix daemon after every
-/// successful build; signs and uploads each output path immediately.
-/// AWS credentials are picked up from /root/.aws/credentials by the SDK.
-function buildPostBuildHook(cfg) {
-    const s3Params = buildNixS3Params(cfg);
-    const copyUri = `s3://${cfg.bucket}?${s3Params}&secret-key=${SIGNING_KEY_PATH}&compression=zstd`;
-    return [
-        "#!/bin/bash",
-        "set -eu",
-        "set -o pipefail",
-        "",
-        'echo "nix-s3-generations: uploading $OUT_PATHS"',
-        `exec /nix/var/nix/profiles/default/bin/nix copy --to "${copyUri}" $OUT_PATHS`,
-        "",
-    ].join("\n");
-}
-async function sudoWriteFile(destPath, content, mode) {
-    const parent = external_node_path_namespaceObject.dirname(destPath);
-    await exec_exec("sudo", ["mkdir", "-p", parent]);
-    await exec_exec("sudo", ["tee", destPath], {
-        input: Buffer.from(content),
-        silent: true,
-    });
-    await exec_exec("sudo", ["chmod", mode, destPath]);
-}
-/// Append to a file already owned by another component (e.g. the Nix installer
-/// owns /etc/nix/nix.conf and may have set experimental-features). Don't
-/// chmod — leave the existing perms alone.
-async function sudoAppendFile(destPath, content) {
-    await exec_exec("sudo", ["tee", "-a", destPath], {
-        input: Buffer.from(content),
-        silent: true,
-    });
-}
-async function configureNixCache(cfg, creds, signingKey) {
-    await sudoWriteFile(AWS_CREDENTIALS_PATH, buildAwsCredentialsFile(creds), "0600");
-    info(`Wrote AWS credentials to ${AWS_CREDENTIALS_PATH}`);
-    await sudoWriteFile(SIGNING_KEY_PATH, signingKey, "0600");
-    info(`Wrote signing key to ${SIGNING_KEY_PATH}`);
-    await sudoWriteFile(POST_BUILD_HOOK_PATH, buildPostBuildHook(cfg), "0755");
-    info(`Wrote post-build hook to ${POST_BUILD_HOOK_PATH}`);
-    // Append to /etc/nix/nix.conf so we don't clobber settings the Nix installer
-    // already wrote (e.g. `experimental-features = nix-command flakes`).
-    await sudoAppendFile(NIX_CONF_PATH, buildNixConf(cfg));
-    info(`Appended cache settings to ${NIX_CONF_PATH}`);
-    // Restart the daemon so it picks up the new substituter, trusted key,
-    // and post-build-hook. Tolerate failure on systems without systemd.
-    await exec_exec("sudo", ["systemctl", "restart", "nix-daemon"], {
-        ignoreReturnCode: true,
-    });
-}
-async function runPost() {
-    info("nix-s3-generations: post phase");
-    const errorInMain = getState(STATE_ERROR_IN_MAIN);
-    if (errorInMain === "true") {
-        info("nix-s3-generations: main phase had an error, skipping post");
-        return;
-    }
-    const preSnapshotPath = getState(STATE_STORE_SNAPSHOT);
-    const binPath = getState(STATE_BIN_PATH);
-    if (!preSnapshotPath) {
-        setFailed("nix-s3-generations: snapshot path not found in state");
-        return;
-    }
-    if (!external_node_fs_namespaceObject.existsSync(preSnapshotPath)) {
-        setFailed(`nix-s3-generations: snapshot file not found at ${preSnapshotPath}`);
-        return;
-    }
-    info(`Using snapshot file: ${preSnapshotPath}`);
-    if (!binPath) {
-        setFailed("nix-s3-generations: binary path not found in state, cannot run push");
-        return;
-    }
+async function gcPhase() {
     const bucket = getInput("bucket", { required: true });
-    const region = getInput("region") || "us-east-1";
     const endpoint = getInput("s3-endpoint", { required: true });
-    // The binary runs as the runner user — it can't read /root/.aws/credentials,
-    // and inputs aren't visible to the AWS SDK. Forward the creds explicitly so
-    // both `nix copy` and the in-process S3 client can authenticate.
-    const accessKeyId = getInput("aws-access-key-id") ||
-        process.env["AWS_ACCESS_KEY_ID"] ||
-        "";
-    const secretAccessKey = getInput("aws-secret-access-key") ||
-        process.env["AWS_SECRET_ACCESS_KEY"] ||
-        "";
-    // The GC domain is the {repo}/{workflow} pair: generations are numbered
-    // and aged out independently per (repo, workflow). The numeric generation
-    // is the run number — monotonic per workflow run. Matrix legs share the
-    // run number and write distinct shard files under it; re-runs reuse the
-    // same run number and intentionally overwrite their shards.
-    const domain = [
-        process.env["GITHUB_REPOSITORY"] ?? "",
-        process.env["GITHUB_WORKFLOW"] ?? "",
-    ].join("/");
-    const generation = process.env["GITHUB_RUN_NUMBER"] ?? "";
+    const region = getInput("region") || DEFAULT_REGION;
+    const baseUrl = getInput("binary-base-url") || DEFAULT_BASE_URL;
+    const version = process.env["GITHUB_ACTION_REF"] || "";
+    const accessKeyId = resolveCredential("aws-access-key-id", "AWS_ACCESS_KEY_ID");
+    const secretAccessKey = resolveCredential("aws-secret-access-key", "AWS_SECRET_ACCESS_KEY");
+    if (!accessKeyId || !secretAccessKey) {
+        throw new Error("nix-s3-generations gc: AWS credentials not provided. Set aws-access-key-id and aws-secret-access-key inputs, or AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY env vars.");
+    }
+    const binPath = await resolveBinary({ baseUrl, version });
+    info(`Binary available at: ${binPath}`);
     const args = [
-        "push",
+        "forget",
         "--bucket",
         bucket,
         "--region",
         region,
         "--endpoint",
         endpoint,
-        "--snapshot-before",
-        preSnapshotPath,
-        "--domain",
-        domain,
-        "--generation",
-        generation,
+        "--prune",
     ];
-    // Only pass --shard-id when RUNNER_NAME is non-empty; the binary defaults
-    // to "gen" otherwise. Empty would fail validation in the binary.
-    const runnerName = process.env["RUNNER_NAME"];
-    if (runnerName) {
-        args.push("--shard-id", runnerName);
+    for (const d of getMultilineInput("domain")) {
+        args.push("--domain", d);
     }
-    info(`Running push with args: ${args.join(" ")}`);
+    const keepLast = getInput("keep-last");
+    if (keepLast)
+        args.push("--keep-last", keepLast);
+    const keepWithin = getInput("keep-within");
+    if (keepWithin)
+        args.push("--keep-within", keepWithin);
+    const forgetBefore = getInput("forget-before");
+    if (forgetBefore)
+        args.push("--forget-before", forgetBefore);
+    info(`Running forget with args: ${args.join(" ")}`);
     const childEnv = {
         ...process.env,
         AWS_ACCESS_KEY_ID: accessKeyId,
@@ -34771,132 +34636,19 @@ async function runPost() {
         AWS_REGION: region,
         AWS_DEFAULT_REGION: region,
     };
-    let exitCode = 0;
-    try {
-        exitCode = await exec_exec(binPath, args, {
-            ignoreReturnCode: true,
-            env: childEnv,
-        });
-    }
-    catch (error) {
-        setFailed(`nix-s3-generations: failed to execute push binary: ${error instanceof Error ? error.message : String(error)}`);
-        cleanupTempFiles(external_node_path_namespaceObject.dirname(preSnapshotPath));
-        return;
-    }
-    if (exitCode === 0) {
-        info("nix-s3-generations: push completed successfully");
-    }
-    else {
-        setFailed(`nix-s3-generations: push failed with exit code ${exitCode}`);
-    }
-    cleanupTempFiles(external_node_path_namespaceObject.dirname(preSnapshotPath));
-    info("nix-s3-generations: post phase complete");
-}
-function cleanupTempFiles(tmpDir) {
-    try {
-        external_node_fs_namespaceObject.rmSync(tmpDir, { recursive: true, force: true });
-        info(`Cleaned up temp dir: ${tmpDir}`);
-    }
-    catch {
-        warning(`Failed to clean up temp dir: ${tmpDir}`);
-    }
-}
-function getTempDir() {
-    const tmpDir = process.env["RUNNER_TEMP"] || external_node_os_namespaceObject.tmpdir();
-    return tmpDir;
-}
-function makeTempDir(prefix) {
-    return external_node_fs_namespaceObject.mkdtempSync(external_node_path_namespaceObject.join(getTempDir(), prefix));
-}
-
-;// CONCATENATED MODULE: ./action/index.ts
-
-
-
-
-
-
-
-
-let writeStream;
-const DEFAULT_BASE_URL = "https://assets.testquorum.dev/binaries/nix-s3-generations/";
-const DEFAULT_REGION = "us-east-1";
-function resolveCredential(inputName, envName) {
-    return getInput(inputName) || process.env[envName] || "";
-}
-async function mainPhase() {
-    const bucket = getInput("bucket", { required: true });
-    const region = getInput("region") || DEFAULT_REGION;
-    const endpoint = getInput("s3-endpoint", { required: true });
-    const publicKey = getInput("public-key", { required: true });
-    const signingKey = getInput("private-key", { required: true });
-    const baseUrl = getInput("binary-base-url") || DEFAULT_BASE_URL;
-    const version = process.env["GITHUB_ACTION_REF"] || "";
-    const accessKeyId = resolveCredential("aws-access-key-id", "AWS_ACCESS_KEY_ID");
-    const secretAccessKey = resolveCredential("aws-secret-access-key", "AWS_SECRET_ACCESS_KEY");
-    if (!accessKeyId || !secretAccessKey) {
-        throw new Error("nix-s3-generations: AWS credentials not provided. Set aws-access-key-id and aws-secret-access-key inputs, or AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY env vars.");
-    }
-    // Configure the cache before resolving the binary so the fallback build
-    // benefits from the substituter and its outputs hit the post-build hook.
-    await configureNixCache({ bucket, region, endpoint, publicKey }, {
-        accessKeyId,
-        secretAccessKey,
-        region,
-    }, signingKey);
-    const binPath = await resolveBinary({ baseUrl, version });
-    info(`Binary available at: ${binPath}`);
-    saveState(STATE_BIN_PATH, binPath);
-    // Pin `--json-format 1` so the output shape is the same `{path: meta}` map
-    // regardless of the installed Nix version's default. Some Nix versions
-    // default to format 2 which wraps entries under `paths`, which the binary's
-    // parser would treat as an empty snapshot. Failures here propagate to the
-    // outer catch in `main()`, which marks the action failed; the post phase
-    // then sees STATE_ERROR_IN_MAIN and skips cleanly. We intentionally don't
-    // fall back to "{}" — that would make every existing path look "new" in
-    // post and trigger an unrelated mass push.
-    const snapshotDir = makeTempDir("nix-s3-generations-snapshot-");
-    const snapshotPath = external_node_path_namespaceObject.join(snapshotDir, "store-snapshot.json");
-    writeStream = external_node_fs_namespaceObject.createWriteStream(snapshotPath);
-    writeStream.on("error", (err) => {
-        warning(`Failed to write snapshot: ${err.message}`);
+    const exitCode = await exec_exec(binPath, args, {
+        ignoreReturnCode: true,
+        env: childEnv,
     });
-    await exec_exec("nix", ["path-info", "--json", "--json-format", "1", "--all"], {
-        silent: true,
-        listeners: {
-            stdout: (data) => {
-                writeStream.write(data);
-            },
-        },
-    });
-    writeStream.end();
-    await new Promise((resolve, reject) => {
-        writeStream.on("finish", resolve);
-        writeStream.on("error", reject);
-    });
-    saveState(STATE_STORE_SNAPSHOT, snapshotPath);
-    info(`Wrote store snapshot to ${snapshotPath}`);
-    saveState(STATE_STARTED, "true");
+    if (exitCode !== 0) {
+        setFailed(`nix-s3-generations gc: forget failed with exit code ${exitCode}`);
+    }
 }
 async function main() {
     try {
-        // Route on either flag: STATE_STARTED is the success signal, but on a
-        // mainPhase failure we still want post to take the runPost branch (which
-        // short-circuits on STATE_ERROR_IN_MAIN) instead of re-running mainPhase.
-        const started = getState(STATE_STARTED);
-        const errored = getState(STATE_ERROR_IN_MAIN);
-        if (started === "" && errored === "") {
-            await mainPhase();
-        }
-        else {
-            await runPost();
-        }
+        await gcPhase();
     }
     catch (error) {
-        if (typeof writeStream !== "undefined") {
-            writeStream.destroy();
-        }
-        saveState(STATE_ERROR_IN_MAIN, "true");
         if (error instanceof Error) {
             setFailed(error.message);
         }
@@ -34907,10 +34659,3 @@ async function main() {
 }
 main();
 
-var __webpack_exports__STATE_BIN_PATH = __webpack_exports__.GB;
-var __webpack_exports__STATE_ERROR_IN_MAIN = __webpack_exports__.x_;
-var __webpack_exports__STATE_STARTED = __webpack_exports__.Iv;
-var __webpack_exports__STATE_STORE_SNAPSHOT = __webpack_exports__.NQ;
-var __webpack_exports__main = __webpack_exports__.iW;
-var __webpack_exports__mainPhase = __webpack_exports__.hb;
-export { __webpack_exports__STATE_BIN_PATH as STATE_BIN_PATH, __webpack_exports__STATE_ERROR_IN_MAIN as STATE_ERROR_IN_MAIN, __webpack_exports__STATE_STARTED as STATE_STARTED, __webpack_exports__STATE_STORE_SNAPSHOT as STATE_STORE_SNAPSHOT, __webpack_exports__main as main, __webpack_exports__mainPhase as mainPhase };

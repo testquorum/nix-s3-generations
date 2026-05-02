@@ -13,9 +13,13 @@ import {
 
 vi.mock("@actions/core");
 vi.mock("@actions/exec");
-vi.mock("../helpers.js", () => ({
-  downloadTool: vi.fn(async (url: string) => `/tmp/downloaded-${url.length}`),
-}));
+vi.mock("@actions/tool-cache", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@actions/tool-cache")>();
+  return {
+    ...actual,
+    downloadTool: vi.fn(async (url: string) => `/tmp/downloaded-${url.length}`),
+  };
+});
 vi.mock("node:os");
 vi.mock("node:fs");
 
@@ -62,8 +66,7 @@ describe("fetchArtifact", () => {
   });
 
   it("constructs URL from baseUrl + version + platform-specific filename", async () => {
-    const helpers = await import("../helpers.js");
-    const downloadTool = vi.mocked(helpers.downloadTool);
+    const downloadTool = vi.mocked(tc.downloadTool);
 
     await fetchArtifact(
       "x86_64-Linux",
@@ -76,8 +79,7 @@ describe("fetchArtifact", () => {
   });
 
   it("appends a trailing slash to baseUrl when missing", async () => {
-    const helpers = await import("../helpers.js");
-    const downloadTool = vi.mocked(helpers.downloadTool);
+    const downloadTool = vi.mocked(tc.downloadTool);
 
     await fetchArtifact(
       "aarch64-Linux",

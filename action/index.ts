@@ -2,19 +2,21 @@ import * as core from "@actions/core";
 import * as exec from "@actions/exec";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
-import {
-  detectPlatform,
-  fetchArtifact,
-  is404Error,
-  unpackClosure,
-} from "./binary-download.js";
+import { resolveBinary } from "./binary-resolve.js";
 import { configureNixCache, makeTempDir, runPost } from "./helpers.js";
+import {
+  STATE_BIN_PATH,
+  STATE_ERROR_IN_MAIN,
+  STATE_STARTED,
+  STATE_STORE_SNAPSHOT,
+} from "./state.js";
 
-export const STATE_STARTED = "STATE_STARTED";
-export const STATE_STORE_SNAPSHOT = "STATE_STORE_SNAPSHOT";
-export const STATE_ERROR_IN_MAIN = "STATE_ERROR_IN_MAIN";
-export const STATE_BIN_PATH = "STATE_BIN_PATH";
+export {
+  STATE_BIN_PATH,
+  STATE_ERROR_IN_MAIN,
+  STATE_STARTED,
+  STATE_STORE_SNAPSHOT,
+} from "./state.js";
 
 let writeStream: fs.WriteStream | undefined;
 
@@ -24,28 +26,6 @@ const DEFAULT_REGION = "us-east-1";
 
 function resolveCredential(inputName: string, envName: string): string {
   return core.getInput(inputName) || process.env[envName] || "";
-}
-
-/// Build the binary from the action's on-disk checkout. GITHUB_ACTION_PATH
-/// is composite-action-only and unset for JS actions, so we locate the root
-/// via the running script: `dist/index.js` after ncc bundling sits one level
-/// below the action root.
-async function buildBinaryFromCheckout(): Promise<string> {
-  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-  core.info(`Falling back to local build from ${root}`);
-  let storePath = "";
-  await exec.exec(
-    "nix",
-    ["build", "--no-link", "--no-write-lock-file", "--print-out-paths", root],
-    {
-      listeners: {
-        stdout: (data: Buffer) => {
-          storePath += data.toString();
-        },
-      },
-    },
-  );
-  return path.join(storePath.trim(), "bin", "nix-s3-generations");
 }
 
 export async function mainPhase(): Promise<void> {
@@ -83,22 +63,7 @@ export async function mainPhase(): Promise<void> {
     signingKey,
   );
 
-  let binPath: string;
-  if (!version) {
-    binPath = await buildBinaryFromCheckout();
-  } else {
-    const platform = detectPlatform();
-    core.info(`Detected platform: ${platform}`);
-    try {
-      const artifactPath = await fetchArtifact(platform, version, baseUrl);
-      binPath = await unpackClosure(artifactPath, "nix-s3-generations");
-    } catch (error) {
-      if (!is404Error(error)) {
-        throw error;
-      }
-      binPath = await buildBinaryFromCheckout();
-    }
-  }
+  const binPath = await resolveBinary({ baseUrl, version });
   core.info(`Binary available at: ${binPath}`);
   core.saveState(STATE_BIN_PATH, binPath);
 

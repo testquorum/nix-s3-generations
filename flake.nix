@@ -44,6 +44,7 @@
           programs.nixfmt.enable = true;
           settings.global.excludes = [
             "dist/**"
+            "gc/dist/**"
             "*.lock"
             "Cargo.lock"
             "package-lock.json"
@@ -106,14 +107,45 @@
         checkArtifacts = craneLib.buildDepsOnly checkArgs;
 
         # --- TypeScript checks ---
+        npmFiles = [
+          ./package.json
+          ./package-lock.json
+          ./tsconfig.json
+        ];
+
+        # Full action/ tree (incl. tests) for lint and test checks.
         tsSrc = pkgs.lib.fileset.toSource {
           root = ./.;
-          fileset = pkgs.lib.fileset.unions [
-            ./package.json
-            ./package-lock.json
-            ./tsconfig.json
-            ./action
-          ];
+          fileset = pkgs.lib.fileset.unions (npmFiles ++ [ ./action ]);
+        };
+
+        # Per-bundle filesets exclude unrelated entrypoints and tests so that
+        # touching gc-index.ts doesn't invalidate the main bundle and vice
+        # versa.
+        mainBundleSrc = pkgs.lib.fileset.toSource {
+          root = ./.;
+          fileset = pkgs.lib.fileset.unions (
+            npmFiles
+            ++ [
+              ./action/index.ts
+              ./action/binary-resolve.ts
+              ./action/binary-download.ts
+              ./action/helpers.ts
+              ./action/state.ts
+            ]
+          );
+        };
+
+        gcBundleSrc = pkgs.lib.fileset.toSource {
+          root = ./.;
+          fileset = pkgs.lib.fileset.unions (
+            npmFiles
+            ++ [
+              ./action/gc-index.ts
+              ./action/binary-resolve.ts
+              ./action/binary-download.ts
+            ]
+          );
         };
 
         npmDepsHash = "sha256-m0QtbzuwfZckjbki9jwgBRGkJv93IrJ5/ERDlRRJRhs=";
@@ -130,43 +162,80 @@
             installPhase = "touch $out";
           };
 
-        # The action's compiled bundle (what gets shipped at dist/index.js).
-        # Built reproducibly from src/ via ncc.
-        distBundle = pkgs.buildNpmPackage {
-          pname = "nix-s3-generations-dist";
-          version = "0.1.0";
-          src = tsSrc;
-          inherit npmDepsHash;
-          dontNpmBuild = true;
-          buildPhase = ''
-            runHook preBuild
-            npm run build
-            runHook postBuild
-          '';
-          installPhase = ''
-            runHook preInstall
-            mkdir -p $out
-            cp -r dist/. $out/
-            runHook postInstall
-          '';
+        bundle =
+          {
+            name,
+            src,
+            script,
+            outDir,
+          }:
+          pkgs.buildNpmPackage {
+            pname = "nix-s3-generations-dist-${name}";
+            version = "0.1.0";
+            inherit src;
+            inherit npmDepsHash;
+            dontNpmBuild = true;
+            buildPhase = ''
+              runHook preBuild
+              npm run ${script}
+              runHook postBuild
+            '';
+            installPhase = ''
+              runHook preInstall
+              mkdir -p $out
+              cp -r ${outDir}/. $out/
+              runHook postInstall
+            '';
+          };
+
+        distMainBundle = bundle {
+          name = "main";
+          src = mainBundleSrc;
+          script = "build:main";
+          outDir = "dist";
         };
 
-        # Verify the committed dist/ matches what `npm run build` would produce.
+        distGcBundle = bundle {
+          name = "gc";
+          src = gcBundleSrc;
+          script = "build:gc";
+          outDir = "gc/dist";
+        };
+
+        # Verify the committed dist/ and gc/dist/ match what `npm run build`
+        # would produce. One check covers both so that a stale bundle in
+        # either location surfaces a single, consistent regeneration command.
         distUpToDate =
           pkgs.runCommand "nix-s3-generations-dist-up-to-date"
             {
               nativeBuildInputs = [ pkgs.diffutils ];
             }
             ''
-              expected=${distBundle}
-              actual=${./dist}
-              if ! diff -r "$expected" "$actual" >/dev/null 2>&1; then
-                echo "Diff between expected (Nix-built) and actual (committed) dist/:" >&2
-                diff -r "$expected" "$actual" >&2 || true
+              expected_main=${distMainBundle}
+              expected_gc=${distGcBundle}
+              actual_main=${./dist}
+              actual_gc=${./gc/dist}
+
+              fail=0
+              if ! diff -r "$expected_main" "$actual_main" >/dev/null 2>&1; then
+                echo "Diff in dist/:" >&2
+                diff -r "$expected_main" "$actual_main" >&2 || true
+                fail=1
+              fi
+              if ! diff -r "$expected_gc" "$actual_gc" >/dev/null 2>&1; then
+                echo "Diff in gc/dist/:" >&2
+                diff -r "$expected_gc" "$actual_gc" >&2 || true
+                fail=1
+              fi
+
+              if [ "$fail" -ne 0 ]; then
                 echo "" >&2
-                echo "ERROR: dist/ is out of date relative to src/." >&2
+                echo "ERROR: dist/ and/or gc/dist/ is out of date relative to action/." >&2
                 echo "To regenerate, run from the repo root:" >&2
-                echo "  chmod -R u+w dist 2>/dev/null; rm -rf dist && cp -r $expected/. dist/" >&2
+                echo "  chmod -R u+w dist gc/dist 2>/dev/null" >&2
+                echo "  rm -rf dist gc/dist" >&2
+                echo "  cp -r $expected_main/. dist/" >&2
+                echo "  cp -r $expected_gc/. gc/dist/" >&2
                 exit 1
               fi
               touch $out
