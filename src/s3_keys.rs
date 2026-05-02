@@ -21,6 +21,28 @@ pub fn generations_key(domain: &str, generation: u64, shard_id: &str) -> String 
     format!("generations/{domain}/{generation}/{shard_id}.json")
 }
 
+/// Inverse of [`generations_key`]: given an S3 key, recover its
+/// `(domain, generation, shard_id)` components. Returns `None` if the key
+/// does not match `generations/{domain}/{generation}/{shard_id}.json` or
+/// the generation segment is not a `u64`.
+///
+/// `domain` may itself contain `/`, so we peel `shard_id` and `generation`
+/// off the right; everything left is the domain.
+pub fn parse_generation_key(key: &str) -> Option<(String, u64, String)> {
+    let rest = key.strip_prefix("generations/")?;
+    let stem = rest.strip_suffix(".json")?;
+
+    let (head, shard_id) = stem.rsplit_once('/')?;
+    let (domain, generation) = head.rsplit_once('/')?;
+
+    if domain.is_empty() || shard_id.is_empty() {
+        return None;
+    }
+
+    let generation: u64 = generation.parse().ok()?;
+    Some((domain.to_string(), generation, shard_id.to_string()))
+}
+
 /// Build the narinfo S3 key for a Nix store path: the 32-character base32
 /// hash prefix of the store path's basename, with `.narinfo` appended.
 /// Example: `/nix/store/x4ay…-nix-s3-generations-closure-root` -> `x4ay….narinfo`.
@@ -127,6 +149,60 @@ mod tests {
         let with_space = generations_key("d", 1, "foo bar");
         let with_dash = generations_key("d", 1, "foo-bar");
         assert_ne!(with_space, with_dash);
+    }
+
+    // Tests for parse_generation_key
+
+    #[test]
+    fn parse_generation_key_simple() {
+        let (domain, generation, shard) =
+            parse_generation_key("generations/standalone/1/gen.json").unwrap();
+        assert_eq!(domain, "standalone");
+        assert_eq!(generation, 1);
+        assert_eq!(shard, "gen");
+    }
+
+    #[test]
+    fn parse_generation_key_domain_with_slashes() {
+        let (domain, generation, shard) =
+            parse_generation_key("generations/owner/repo/ci/42/GitHub Actions 3.json").unwrap();
+        assert_eq!(domain, "owner/repo/ci");
+        assert_eq!(generation, 42);
+        assert_eq!(shard, "GitHub Actions 3");
+    }
+
+    #[test]
+    fn parse_generation_key_round_trip() {
+        let key = generations_key("owner/repo/ci", 42, "shard 1");
+        let (domain, generation, shard) = parse_generation_key(&key).unwrap();
+        assert_eq!(domain, "owner/repo/ci");
+        assert_eq!(generation, 42);
+        assert_eq!(shard, "shard 1");
+    }
+
+    #[test]
+    fn parse_generation_key_rejects_wrong_prefix() {
+        assert!(parse_generation_key("nar/abc.json").is_none());
+        assert!(parse_generation_key("d/1/g.json").is_none());
+    }
+
+    #[test]
+    fn parse_generation_key_rejects_wrong_suffix() {
+        assert!(parse_generation_key("generations/d/1/g.txt").is_none());
+        assert!(parse_generation_key("generations/d/1/g").is_none());
+    }
+
+    #[test]
+    fn parse_generation_key_rejects_non_numeric_generation() {
+        assert!(parse_generation_key("generations/d/notanumber/g.json").is_none());
+    }
+
+    #[test]
+    fn parse_generation_key_rejects_missing_components() {
+        // No generation+shard segments after the domain.
+        assert!(parse_generation_key("generations/d.json").is_none());
+        // Empty domain.
+        assert!(parse_generation_key("generations//1/g.json").is_none());
     }
 
     #[test]

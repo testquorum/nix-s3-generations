@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+mod forget;
 mod generation;
 mod narinfo;
 mod nix;
@@ -24,6 +25,8 @@ enum Commands {
     Push(push::PushArgs),
     /// Prune dead NARs from S3 bucket
     Prune(prune::PruneArgs),
+    /// Forget generation roots according to a retention policy
+    Forget(forget::ForgetArgs),
 }
 
 #[tokio::main]
@@ -35,5 +38,6 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Push(args) => push::run(args).await,
         Commands::Prune(args) => prune::run(args).await,
+        Commands::Forget(args) => forget::run(args).await,
     }
 }
