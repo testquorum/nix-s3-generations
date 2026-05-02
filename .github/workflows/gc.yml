@@ -1,0 +1,27 @@
+name: GC
+
+on:
+  schedule:
+    - cron: "17 7 * * 3"
+  workflow_dispatch:
+
+jobs:
+  gc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            extra-substituters = https://nixcache.testquorum.dev
+            extra-trusted-public-keys = nixcache.testquorum.dev-1:aS+CJF8O8Ebirc6hypMfq/061h5TJlbsej1+zUJHPec=
+
+      - uses: ./gc
+        with:
+          bucket: testquorum-nix-public
+          s3-endpoint: ba58a56742691d9efc310cca51093d04.r2.cloudflarestorage.com
+          region: auto
+          aws-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          forget-before: "30d"

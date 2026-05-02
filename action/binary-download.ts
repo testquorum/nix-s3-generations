@@ -4,7 +4,6 @@ import * as tc from "@actions/tool-cache";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { downloadTool } from "./helpers.js";
 
 /**
  * True when the error came from `tc.downloadTool` for a URL that returned 404.
@@ -41,7 +40,7 @@ export async function fetchArtifact(
   const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
   const url = `${base}${version}/${artifactName}`;
   core.info(`Downloading artifact from ${url}`);
-  const downloadPath = await downloadTool(url);
+  const downloadPath = await tc.downloadTool(url);
   core.info(`Downloaded artifact to ${downloadPath}`);
   return downloadPath;
 }

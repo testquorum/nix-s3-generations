@@ -1,0 +1,43 @@
+name: "Nix S3 Generations GC"
+description: "Run retention-based GC against the S3 generations cache (forget + prune)"
+inputs:
+  s3-endpoint:
+    description: "S3 endpoint URL"
+    required: true
+  bucket:
+    description: "S3 bucket name for the cache"
+    required: true
+  region:
+    description: "AWS region"
+    required: false
+  aws-access-key-id:
+    description: "AWS access key ID. Falls back to AWS_ACCESS_KEY_ID env var."
+    required: false
+  aws-secret-access-key:
+    description: "AWS secret access key. Falls back to AWS_SECRET_ACCESS_KEY env var."
+    required: false
+  binary-base-url:
+    description: "Base URL for downloading the nix-s3-generations binary closure"
+    required: false
+  domain:
+    description: |
+      Limit GC to these generation domains. Multiline string; one domain per
+      line. If unset, every domain under generations/ is considered.
+    required: false
+  keep-last:
+    description: "Keep the N most recent generations per domain."
+    required: false
+  keep-within:
+    description: |
+      Keep generations whose timestamp is within this duration of the newest
+      generation in the same domain (e.g. "7days", "12h", "2weeks").
+    required: false
+  forget-before:
+    description: |
+      Forget generations whose timestamp is older than this duration before
+      now (wall-clock). Same syntax as keep-within. Escape hatch for stale
+      domains that no longer push.
+    required: false
+runs:
+  using: "node24"
+  main: "./dist/index.js"

@@ -1,6 +1,5 @@
 import * as core from "@actions/core";
 import * as exec from "@actions/exec";
-import * as tc from "@actions/tool-cache";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -8,7 +7,7 @@ import {
   STATE_BIN_PATH,
   STATE_ERROR_IN_MAIN,
   STATE_STORE_SNAPSHOT,
-} from "./index.js";
+} from "./state.js";
 
 export const NIX_CONF_PATH = "/etc/nix/nix.conf";
 export const AWS_CREDENTIALS_PATH = "/root/.aws/credentials";
@@ -279,8 +278,4 @@ export function getTempDir(): string {
 
 export function makeTempDir(prefix: string): string {
   return fs.mkdtempSync(path.join(getTempDir(), prefix));
-}
-
-export async function downloadTool(url: string): Promise<string> {
-  return tc.downloadTool(url);
 }
