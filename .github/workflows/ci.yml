@@ -25,7 +25,8 @@ jobs:
       # main phase 404s against R2 and falls back to building the binary
       # from the on-disk checkout. The later `nix-fast-build` and export
       # steps just reuse that already-built store path.
-      - uses: ./
+      - name: Setup Nix S3 Cache
+        uses: ./
         with:
           bucket: testquorum-nix-public
           s3-endpoint: ba58a56742691d9efc310cca51093d04.r2.cloudflarestorage.com
