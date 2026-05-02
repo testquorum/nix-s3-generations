@@ -2,7 +2,9 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 mod generation;
+mod narinfo;
 mod nix;
+mod prune;
 mod push;
 mod s3;
 mod s3_keys;
@@ -20,6 +22,8 @@ struct Cli {
 enum Commands {
     /// Push Nix closures to S3
     Push(push::PushArgs),
+    /// Prune dead NARs from S3 bucket
+    Prune(prune::PruneArgs),
 }
 
 #[tokio::main]
@@ -30,5 +34,6 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Push(args) => push::run(args).await,
+        Commands::Prune(args) => prune::run(args).await,
     }
 }

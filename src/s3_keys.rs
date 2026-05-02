@@ -39,6 +39,50 @@ pub fn narinfo_key(store_path: &NixStorePath) -> anyhow::Result<String> {
     Ok(format!("{hash}.narinfo"))
 }
 
+/// Convert a References-format hash name (e.g., `x4ay-bash-5.2`) to a narinfo key
+/// by splitting on the first `-` and appending `.narinfo`.
+///
+/// This takes the SHORT format (like `x4ay-bash-5.2`) used in NARinfo References
+/// (space-separated hash-name strings) and converts it to the S3 key format.
+pub fn hash_name_to_narinfo_key(hash_name: &str) -> String {
+    let (hash, _) = hash_name.split_once('-').unwrap_or((hash_name, ""));
+    format!("{hash}.narinfo")
+}
+
+/// Returns true if the S3 key is a narinfo file (ends with `.narinfo`).
+pub fn is_narinfo_key(key: &str) -> bool {
+    key.ends_with(".narinfo")
+}
+
+/// Validate and return a NAR URL.
+///
+/// - Rejects path traversal sequences (`..`)
+/// - Rejects absolute URLs (`http://` or `https://`)
+/// - Ensures the path starts with `nar/`
+pub fn sanitize_nar_url(url: &str) -> anyhow::Result<String> {
+    // Reject empty string
+    anyhow::ensure!(!url.is_empty(), "NAR URL cannot be empty");
+
+    // Reject absolute URLs
+    anyhow::ensure!(
+        !url.starts_with("http://") && !url.starts_with("https://"),
+        "NAR URL must not be an absolute HTTP URL: {url}"
+    );
+
+    // Reject path traversal
+    anyhow::ensure!(
+        !url.contains(".."),
+        "NAR URL must not contain path traversal: {url}"
+    );
+
+    // Ensure starts with nar/
+    if !url.starts_with("nar/") {
+        anyhow::bail!("NAR URL must start with 'nar/': {url}");
+    }
+
+    Ok(url.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,5 +148,90 @@ mod tests {
     fn narinfo_key_errors_on_basename_without_separator() {
         let p = nsp("/nix/store/nohyphen");
         assert!(narinfo_key(&p).is_err());
+    }
+
+    // Tests for hash_name_to_narinfo_key
+
+    #[test]
+    fn hash_name_to_narinfo_key_simple() {
+        assert_eq!(hash_name_to_narinfo_key("x4ay-bash-5.2"), "x4ay.narinfo");
+    }
+
+    #[test]
+    fn hash_name_to_narinfo_key_multiple_hyphens() {
+        assert_eq!(hash_name_to_narinfo_key("abc-pkg-1.0"), "abc.narinfo");
+    }
+
+    #[test]
+    fn hash_name_to_narinfo_key_single_hyphen() {
+        assert_eq!(hash_name_to_narinfo_key("x4ay-nix"), "x4ay.narinfo");
+    }
+
+    #[test]
+    fn hash_name_to_narinfo_key_no_hyphen() {
+        // No hyphen - hash is the entire string
+        assert_eq!(hash_name_to_narinfo_key("nohyphen"), "nohyphen.narinfo");
+    }
+
+    // Tests for is_narinfo_key
+
+    #[test]
+    fn is_narinfo_key_true_for_narinfo() {
+        assert!(is_narinfo_key("x4ayiscwbhcj89ija7s294jrdjss4009.narinfo"));
+    }
+
+    #[test]
+    fn is_narinfo_key_false_for_other_extensions() {
+        assert!(!is_narinfo_key("x4ay.nar"));
+        assert!(!is_narinfo_key("x4ay.json"));
+        assert!(!is_narinfo_key("x4ay.txt"));
+    }
+
+    #[test]
+    fn is_narinfo_key_false_for_empty_string() {
+        assert!(!is_narinfo_key(""));
+    }
+
+    #[test]
+    fn is_narinfo_key_false_for_path_with_narinfo_in_middle() {
+        assert!(!is_narinfo_key("nar/x4ay.narinfo/file"));
+    }
+
+    // Tests for sanitize_nar_url
+
+    #[test]
+    fn sanitize_nar_url_valid() {
+        assert_eq!(
+            sanitize_nar_url("nar/abc.nar.xz").unwrap(),
+            "nar/abc.nar.xz"
+        );
+        assert_eq!(
+            sanitize_nar_url("nar/x4ayiscwbhcj89ija7s294jrdjss4009.narinfo").unwrap(),
+            "nar/x4ayiscwbhcj89ija7s294jrdjss4009.narinfo"
+        );
+    }
+
+    #[test]
+    fn sanitize_nar_url_rejects_path_traversal() {
+        assert!(sanitize_nar_url("../../etc/passwd").is_err());
+        assert!(sanitize_nar_url("nar/../etc/passwd").is_err());
+        assert!(sanitize_nar_url("nar/foo/../bar").is_err());
+    }
+
+    #[test]
+    fn sanitize_nar_url_rejects_absolute_http_url() {
+        assert!(sanitize_nar_url("http://evil.com/nar/abc.narinfo").is_err());
+        assert!(sanitize_nar_url("https://evil.com/nar/abc.narinfo").is_err());
+    }
+
+    #[test]
+    fn sanitize_nar_url_rejects_empty_string() {
+        assert!(sanitize_nar_url("").is_err());
+    }
+
+    #[test]
+    fn sanitize_nar_url_rejects_missing_nar_prefix() {
+        assert!(sanitize_nar_url("abc.narinfo").is_err());
+        assert!(sanitize_nar_url("file.narinfo").is_err());
     }
 }

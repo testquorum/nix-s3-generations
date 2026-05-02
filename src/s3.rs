@@ -89,6 +89,59 @@ impl S3Client {
             }
         }
     }
+
+    /// List objects with the given prefix. Uses pagination via `into_paginator()`.
+    pub async fn list_objects(&self, prefix: &str) -> Result<Vec<String>> {
+        let mut keys = Vec::new();
+        let paginator = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(prefix)
+            .into_paginator();
+
+        let mut stream = paginator.send();
+
+        loop {
+            match stream.next().await {
+                Some(Ok(output)) => {
+                    for obj in output.contents() {
+                        if let Some(key) = obj.key() {
+                            keys.push(key.to_string());
+                        }
+                    }
+                }
+                Some(Err(e)) => return Err(e.into()),
+                None => break,
+            }
+        }
+        Ok(keys)
+    }
+
+    /// Get an object by key. Returns the object body as bytes.
+    pub async fn get_object(&self, key: &str) -> Result<Vec<u8>> {
+        let output = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await?;
+
+        let data = output.body.collect().await?.into_bytes().to_vec();
+        Ok(data)
+    }
+
+    /// Delete an object by key.
+    pub async fn delete_object(&self, key: &str) -> Result<()> {
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -188,6 +241,138 @@ mod tests {
         )]);
 
         let result = client.object_exists("test-key").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_list_objects_single_page() {
+        let response_body = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult>
+  <Contents>
+    <Key>prefix/key1</Key>
+  </Contents>
+  <Contents>
+    <Key>prefix/key2</Key>
+  </Contents>
+</ListBucketResult>"#;
+        let client = mock_client(vec![ReplayEvent::new(
+            empty_request(),
+            http::Response::builder()
+                .status(200)
+                .body(SdkBody::from(response_body))
+                .unwrap(),
+        )]);
+
+        let keys = client.list_objects("prefix/").await.unwrap();
+        assert_eq!(keys, vec!["prefix/key1", "prefix/key2"]);
+    }
+
+    #[tokio::test]
+    async fn test_list_objects_empty_bucket() {
+        let response_body = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult>
+</ListBucketResult>"#;
+        let client = mock_client(vec![ReplayEvent::new(
+            empty_request(),
+            http::Response::builder()
+                .status(200)
+                .body(SdkBody::from(response_body))
+                .unwrap(),
+        )]);
+
+        let keys = client.list_objects("prefix/").await.unwrap();
+        assert!(keys.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_objects_pagination() {
+        let response_body_page1 = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult>
+  <Contents>
+    <Key>prefix/key1</Key>
+  </Contents>
+  <NextContinuationToken>token123</NextContinuationToken>
+</ListBucketResult>"#;
+        let response_body_page2 = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult>
+  <Contents>
+    <Key>prefix/key2</Key>
+  </Contents>
+</ListBucketResult>"#;
+        let client = mock_client(vec![
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(response_body_page1))
+                    .unwrap(),
+            ),
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(response_body_page2))
+                    .unwrap(),
+            ),
+        ]);
+
+        let keys = client.list_objects("prefix/").await.unwrap();
+        assert_eq!(keys, vec!["prefix/key1", "prefix/key2"]);
+    }
+
+    #[tokio::test]
+    async fn test_get_object_success() {
+        let response_body = "hello world";
+        let client = mock_client(vec![ReplayEvent::new(
+            empty_request(),
+            http::Response::builder()
+                .status(200)
+                .body(SdkBody::from(response_body))
+                .unwrap(),
+        )]);
+
+        let data = client.get_object("test-key").await.unwrap();
+        assert_eq!(data, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn test_get_object_not_found() {
+        let client = mock_client(vec![ReplayEvent::new(
+            empty_request(),
+            http::Response::builder()
+                .status(404)
+                .body(SdkBody::empty())
+                .unwrap(),
+        )]);
+
+        let result = client.get_object("missing-key").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_delete_object_success() {
+        let client = mock_client(vec![ReplayEvent::new(
+            empty_request(),
+            http::Response::builder()
+                .status(200)
+                .body(SdkBody::empty())
+                .unwrap(),
+        )]);
+
+        client.delete_object("test-key").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_delete_object_error() {
+        let client = mock_client(vec![ReplayEvent::new(
+            empty_request(),
+            http::Response::builder()
+                .status(500)
+                .body(SdkBody::from("internal error"))
+                .unwrap(),
+        )]);
+
+        let result = client.delete_object("test-key").await;
         assert!(result.is_err());
     }
 }
