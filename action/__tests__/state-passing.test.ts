@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import * as core from "@actions/core";
 import * as exec from "@actions/exec";
 import * as fs from "node:fs";
@@ -44,6 +44,7 @@ describe("state passing", () => {
     vi.clearAllMocks();
     process.env["AWS_ACCESS_KEY_ID"] = "test-akid";
     process.env["AWS_SECRET_ACCESS_KEY"] = "test-secret";
+    process.env["GITHUB_ACTION_REF"] = "test-sha";
 
     vi.mocked(core.getInput).mockImplementation(
       (name: string) => inputs[name] ?? "",
@@ -62,6 +63,10 @@ describe("state passing", () => {
     vi.mocked(core.setFailed).mockImplementation(() => {});
   });
 
+  afterEach(() => {
+    delete process.env["GITHUB_ACTION_REF"];
+  });
+
   it("saves STATE_STARTED as 'true' after mainPhase completes", async () => {
     inputs = {
       "public-key":
@@ -69,7 +74,6 @@ describe("state passing", () => {
       bucket: "my-bucket",
       "s3-endpoint": "abc.r2.cloudflarestorage.com",
       "private-key": "my-key",
-      version: "test-sha",
     };
     stateStore.set(STATE_STARTED, "");
 
@@ -85,7 +89,6 @@ describe("state passing", () => {
       bucket: "my-bucket",
       "s3-endpoint": "abc.r2.cloudflarestorage.com",
       "private-key": "my-key",
-      version: "test-sha",
     };
     stateStore.set(STATE_STARTED, "");
 
@@ -104,7 +107,6 @@ describe("state passing", () => {
       bucket: "my-bucket",
       "s3-endpoint": "abc.r2.cloudflarestorage.com",
       "private-key": "my-key",
-      version: "test-sha",
     };
     stateStore.set(STATE_STARTED, "");
 
@@ -125,7 +127,6 @@ describe("state passing", () => {
       "s3-endpoint": "abc.r2.cloudflarestorage.com",
       "private-key": "my-key",
       region: "us-west-2",
-      version: "test-sha",
     };
 
     stateStore.set(STATE_STARTED, "");
@@ -160,7 +161,6 @@ describe("state passing", () => {
       bucket: "my-bucket",
       "s3-endpoint": "abc.r2.cloudflarestorage.com",
       "private-key": "my-key",
-      version: "test-sha",
     };
     stateStore.set(STATE_STARTED, "");
 

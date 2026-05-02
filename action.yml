@@ -25,9 +25,6 @@ inputs:
   binary-base-url:
     description: "Base URL for downloading the nix-s3-generations binary closure"
     required: false
-  version:
-    description: "Version of the nix-s3-generations binary to download"
-    required: false
 runs:
   using: "node24"
   main: "./dist/index.js"

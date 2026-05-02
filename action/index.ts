@@ -55,8 +55,7 @@ export async function mainPhase(): Promise<void> {
   const publicKey = core.getInput("public-key", { required: true });
   const signingKey = core.getInput("private-key", { required: true });
   const baseUrl = core.getInput("binary-base-url") || DEFAULT_BASE_URL;
-  const versionInput = core.getInput("version");
-  const version = versionInput || process.env["GITHUB_ACTION_REF"] || "";
+  const version = process.env["GITHUB_ACTION_REF"] || "";
 
   const accessKeyId = resolveCredential(
     "aws-access-key-id",
@@ -94,10 +93,7 @@ export async function mainPhase(): Promise<void> {
       const artifactPath = await fetchArtifact(platform, version, baseUrl);
       binPath = await unpackClosure(artifactPath, "nix-s3-generations");
     } catch (error) {
-      // Only fall back when version came from GITHUB_ACTION_REF — an explicit
-      // `version` input must fail loudly on 404, not silently substitute a
-      // different binary.
-      if (versionInput || !is404Error(error)) {
+      if (!is404Error(error)) {
         throw error;
       }
       binPath = await buildBinaryFromCheckout();
