@@ -34573,8 +34573,17 @@ async function runPost() {
         info("nix-s3-generations: main phase had an error, skipping post");
         return;
     }
-    const preSnapshot = getState(STATE_STORE_SNAPSHOT);
+    const preSnapshotPath = getState(STATE_STORE_SNAPSHOT);
     const binPath = getState(STATE_BIN_PATH);
+    if (!preSnapshotPath) {
+        setFailed("nix-s3-generations: snapshot path not found in state");
+        return;
+    }
+    if (!external_node_fs_namespaceObject.existsSync(preSnapshotPath)) {
+        setFailed(`nix-s3-generations: snapshot file not found at ${preSnapshotPath}`);
+        return;
+    }
+    info(`Using snapshot file: ${preSnapshotPath}`);
     if (!binPath) {
         setFailed("nix-s3-generations: binary path not found in state, cannot run push");
         return;
@@ -34591,10 +34600,6 @@ async function runPost() {
     const secretAccessKey = getInput("aws-secret-access-key") ||
         process.env["AWS_SECRET_ACCESS_KEY"] ||
         "";
-    const tmpDir = makeTempDir("nix-s3-generations-post-");
-    const preSnapshotPath = external_node_path_namespaceObject.join(tmpDir, "pre-snapshot.json");
-    external_node_fs_namespaceObject.writeFileSync(preSnapshotPath, preSnapshot || "{}");
-    info(`Wrote pre-step snapshot to ${preSnapshotPath}`);
     // The GC domain is the {repo}/{workflow} pair: generations are numbered
     // and aged out independently per (repo, workflow). The numeric generation
     // is the run number — monotonic per workflow run. Matrix legs share the
@@ -34643,7 +34648,7 @@ async function runPost() {
     }
     catch (error) {
         setFailed(`nix-s3-generations: failed to execute push binary: ${error instanceof Error ? error.message : String(error)}`);
-        cleanupTempFiles(tmpDir);
+        cleanupTempFiles(external_node_path_namespaceObject.dirname(preSnapshotPath));
         return;
     }
     if (exitCode === 0) {
@@ -34652,7 +34657,7 @@ async function runPost() {
     else {
         setFailed(`nix-s3-generations: push failed with exit code ${exitCode}`);
     }
-    cleanupTempFiles(tmpDir);
+    cleanupTempFiles(external_node_path_namespaceObject.dirname(preSnapshotPath));
     info("nix-s3-generations: post phase complete");
 }
 function cleanupTempFiles(tmpDir) {
@@ -34745,10 +34750,13 @@ async function unpackClosure(artifactPath, binName) {
 
 
 
+
+
 const STATE_STARTED = "STATE_STARTED";
 const STATE_STORE_SNAPSHOT = "STATE_STORE_SNAPSHOT";
 const STATE_ERROR_IN_MAIN = "STATE_ERROR_IN_MAIN";
 const STATE_BIN_PATH = "STATE_BIN_PATH";
+let writeStream;
 const DEFAULT_BASE_URL = "https://assets.testquorum.dev/binaries/nix-s3-generations/";
 const DEFAULT_REGION = "us-east-1";
 function resolveCredential(inputName, envName) {
@@ -34797,15 +34805,27 @@ async function mainPhase() {
     // then sees STATE_ERROR_IN_MAIN and skips cleanly. We intentionally don't
     // fall back to "{}" — that would make every existing path look "new" in
     // post and trigger an unrelated mass push.
-    let snapshotOutput = "";
+    const snapshotDir = makeTempDir("nix-s3-generations-snapshot-");
+    const snapshotPath = external_node_path_namespaceObject.join(snapshotDir, "store-snapshot.json");
+    writeStream = external_node_fs_namespaceObject.createWriteStream(snapshotPath);
+    writeStream.on("error", (err) => {
+        warning(`Failed to write snapshot: ${err.message}`);
+    });
     await exec_exec("nix", ["path-info", "--json", "--json-format", "1", "--all"], {
+        silent: true,
         listeners: {
             stdout: (data) => {
-                snapshotOutput += data.toString();
+                writeStream.write(data);
             },
         },
     });
-    saveState(STATE_STORE_SNAPSHOT, snapshotOutput);
+    writeStream.end();
+    await new Promise((resolve, reject) => {
+        writeStream.on("finish", resolve);
+        writeStream.on("error", reject);
+    });
+    saveState(STATE_STORE_SNAPSHOT, snapshotPath);
+    info(`Wrote store snapshot to ${snapshotPath}`);
     saveState(STATE_STARTED, "true");
 }
 async function main() {
@@ -34823,6 +34843,9 @@ async function main() {
         }
     }
     catch (error) {
+        if (typeof writeStream !== "undefined") {
+            writeStream.destroy();
+        }
         saveState(STATE_ERROR_IN_MAIN, "true");
         if (error instanceof Error) {
             setFailed(error.message);

@@ -1,9 +1,18 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import * as core from "@actions/core";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import * as os from "node:os";
 import { main, STATE_STARTED, STATE_ERROR_IN_MAIN } from "../index.js";
 
 vi.mock("@actions/core");
-vi.mock("@actions/exec");
+vi.mock("@actions/exec", () => ({
+  exec: vi.fn(async (_cmd: string, _args?: string[], options?: any) => {
+    const data = Buffer.from("{}");
+    options?.listeners?.stdout?.(data);
+    return 0;
+  }),
+}));
 vi.mock("../binary-download.js", () => ({
   detectPlatform: vi.fn(() => "x86_64-Linux"),
   fetchArtifact: vi.fn(async () => "/tmp/artifact.closure.zst"),
@@ -14,6 +23,9 @@ vi.mock("../binary-download.js", () => ({
 vi.mock("../helpers.js", () => ({
   runPost: vi.fn(async () => {}),
   configureNixCache: vi.fn(async () => {}),
+  makeTempDir: vi.fn((prefix: string) => {
+    return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  }),
 }));
 
 describe("phase detection", () => {

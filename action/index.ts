@@ -5,12 +5,16 @@ import {
   fetchArtifact,
   unpackClosure,
 } from "./binary-download.js";
-import { configureNixCache, runPost } from "./helpers.js";
+import { configureNixCache, makeTempDir, runPost } from "./helpers.js";
+import * as fs from "node:fs";
+import * as path from "node:path";
 
 export const STATE_STARTED = "STATE_STARTED";
 export const STATE_STORE_SNAPSHOT = "STATE_STORE_SNAPSHOT";
 export const STATE_ERROR_IN_MAIN = "STATE_ERROR_IN_MAIN";
 export const STATE_BIN_PATH = "STATE_BIN_PATH";
+
+let writeStream: fs.WriteStream | undefined;
 
 const DEFAULT_BASE_URL =
   "https://assets.testquorum.dev/binaries/nix-s3-generations/";
@@ -82,19 +86,31 @@ export async function mainPhase(): Promise<void> {
   // then sees STATE_ERROR_IN_MAIN and skips cleanly. We intentionally don't
   // fall back to "{}" — that would make every existing path look "new" in
   // post and trigger an unrelated mass push.
-  let snapshotOutput = "";
+  const snapshotDir = makeTempDir("nix-s3-generations-snapshot-");
+  const snapshotPath = path.join(snapshotDir, "store-snapshot.json");
+  writeStream = fs.createWriteStream(snapshotPath);
+  writeStream.on("error", (err) => {
+    core.warning(`Failed to write snapshot: ${err.message}`);
+  });
   await exec.exec(
     "nix",
     ["path-info", "--json", "--json-format", "1", "--all"],
     {
+      silent: true,
       listeners: {
         stdout: (data: Buffer) => {
-          snapshotOutput += data.toString();
+          writeStream!.write(data);
         },
       },
     },
   );
-  core.saveState(STATE_STORE_SNAPSHOT, snapshotOutput);
+  writeStream.end();
+  await new Promise<void>((resolve, reject) => {
+    writeStream!.on("finish", resolve);
+    writeStream!.on("error", reject);
+  });
+  core.saveState(STATE_STORE_SNAPSHOT, snapshotPath);
+  core.info(`Wrote store snapshot to ${snapshotPath}`);
 
   core.saveState(STATE_STARTED, "true");
 }
@@ -112,6 +128,9 @@ export async function main(): Promise<void> {
       await runPost();
     }
   } catch (error) {
+    if (typeof writeStream !== "undefined") {
+      writeStream.destroy();
+    }
     core.saveState(STATE_ERROR_IN_MAIN, "true");
     if (error instanceof Error) {
       core.setFailed(error.message);
