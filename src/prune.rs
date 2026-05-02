@@ -2,11 +2,15 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use clap::Args;
+use futures::stream::{self, StreamExt};
 
 use crate::generation::GenerationRoot;
 use crate::narinfo;
 use crate::s3::S3Client;
 use crate::s3_keys;
+
+/// Maximum number of concurrent S3 GETs per mark-phase wave.
+const MARK_CONCURRENCY: usize = 32;
 
 #[derive(Args, Debug, Clone)]
 pub struct PruneArgs {
@@ -72,34 +76,15 @@ pub async fn mark_phase(s3: &S3Client) -> Result<HashSet<String>> {
     tracing::info!("listing generation objects under generations/");
     let keys = s3.list_objects("generations/").await?;
 
-    let gen_keys: Vec<&String> = keys.iter().filter(|k| k.ends_with(".json")).collect();
-    tracing::info!(
-        total_keys = keys.len(),
-        generation_files = gen_keys.len(),
-        "listed S3 objects"
-    );
+    let gen_keys: Vec<String> = keys.into_iter().filter(|k| k.ends_with(".json")).collect();
+    tracing::info!(generation_files = gen_keys.len(), "listed generation files");
 
-    let mut gc_roots: Vec<String> = Vec::new();
-
-    for key in &gen_keys {
-        let body = match s3.get_object(key).await {
-            Ok(data) => data,
-            Err(e) => {
-                tracing::warn!(key = key.as_str(), error = %e, "failed to fetch generation JSON, skipping");
-                continue;
-            }
-        };
-
-        let root: GenerationRoot = match serde_json::from_slice(&body) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(key = key.as_str(), error = %e, "failed to parse generation JSON, skipping");
-                continue;
-            }
-        };
-
-        gc_roots.push(root.store_path.as_str().to_string());
-    }
+    let gc_roots: Vec<String> = stream::iter(gen_keys.into_iter())
+        .map(|key| fetch_generation_root(s3, key))
+        .buffer_unordered(MARK_CONCURRENCY)
+        .filter_map(|r| async move { r })
+        .collect()
+        .await;
 
     tracing::info!(
         gc_roots = gc_roots.len(),
@@ -132,62 +117,43 @@ pub async fn mark_phase(s3: &S3Client) -> Result<HashSet<String>> {
 
     let mut dfs_count = 0u64;
 
-    while let Some(narinfo_key) = stack.pop() {
-        dfs_count += 1;
+    while !stack.is_empty() {
+        let wave_size = stack.len();
+        dfs_count += wave_size as u64;
 
-        if dfs_count.is_multiple_of(100) {
-            let live_count = narinfo_states
-                .values()
-                .filter(|s| **s == NarinfoState::Live)
-                .count();
-            tracing::info!(
-                "mark phase: processed {} NARinfos, {} live",
-                dfs_count,
-                live_count
-            );
-        }
+        let wave: Vec<(String, NarinfoOutcome)> = stream::iter(stack.drain(..))
+            .map(|key| fetch_and_parse_narinfo(s3, key))
+            .buffer_unordered(MARK_CONCURRENCY)
+            .collect()
+            .await;
 
-        let body = match s3.get_object(&narinfo_key).await {
-            Ok(data) => data,
-            Err(e) => {
-                if is_not_found(&e) {
-                    tracing::warn!(key = %narinfo_key, "NARinfo not found (404), skipping references");
-                } else {
-                    tracing::warn!(key = %narinfo_key, error = %e, "failed to fetch NARinfo, skipping references");
+        for (key, outcome) in wave {
+            match outcome {
+                NarinfoOutcome::Live(refs) => {
+                    narinfo_states.insert(key, NarinfoState::Live);
+                    for ref_key in refs {
+                        if !narinfo_states.contains_key(&ref_key) {
+                            narinfo_states.insert(ref_key.clone(), NarinfoState::Dead);
+                            stack.push(ref_key);
+                        }
+                    }
                 }
-                narinfo_states.insert(narinfo_key, NarinfoState::Dead);
-                continue;
-            }
-        };
-
-        let body_str = match std::str::from_utf8(&body) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(key = %narinfo_key, error = %e, "NARinfo body is not valid UTF-8, skipping");
-                narinfo_states.insert(narinfo_key, NarinfoState::Dead);
-                continue;
-            }
-        };
-
-        let narinfo = match narinfo::parse_narinfo(body_str) {
-            Ok(info) => {
-                narinfo_states.insert(narinfo_key.clone(), NarinfoState::Live);
-                info
-            }
-            Err(e) => {
-                tracing::warn!(key = %narinfo_key, error = %e, "failed to parse NARinfo, skipping references");
-                narinfo_states.insert(narinfo_key, NarinfoState::Dead);
-                continue;
-            }
-        };
-
-        for reference in &narinfo.references {
-            let ref_key = s3_keys::hash_name_to_narinfo_key(reference);
-            if !narinfo_states.contains_key(&ref_key) {
-                narinfo_states.insert(ref_key.clone(), NarinfoState::Dead);
-                stack.push(ref_key);
+                NarinfoOutcome::Dead => {
+                    narinfo_states.insert(key, NarinfoState::Dead);
+                }
             }
         }
+
+        let live_count = narinfo_states
+            .values()
+            .filter(|s| **s == NarinfoState::Live)
+            .count();
+        tracing::info!(
+            processed = dfs_count,
+            live = live_count,
+            wave = wave_size,
+            "mark phase wave complete"
+        );
     }
 
     let live_count = narinfo_states
@@ -209,6 +175,77 @@ pub async fn mark_phase(s3: &S3Client) -> Result<HashSet<String>> {
         .collect();
 
     Ok(live_hashes)
+}
+
+/// Outcome of fetching + parsing a single narinfo during the mark phase.
+enum NarinfoOutcome {
+    /// Narinfo was fetched and parsed; the inner `Vec` holds newly-discovered
+    /// narinfo S3 keys (references already converted via `hash_name_to_narinfo_key`).
+    Live(Vec<String>),
+    /// Narinfo returned 404 or failed to parse — visited but dead.
+    Dead,
+}
+
+/// Fetch a single generation JSON and extract its store path. Returns `None`
+/// (with a logged warning) on fetch / parse failure.
+async fn fetch_generation_root(s3: &S3Client, key: String) -> Option<String> {
+    let body = match s3.get_object(&key).await {
+        Ok(data) => data,
+        Err(e) => {
+            tracing::warn!(key = %key, error = %e, "failed to fetch generation JSON, skipping");
+            return None;
+        }
+    };
+
+    let root: GenerationRoot = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(key = %key, error = %e, "failed to parse generation JSON, skipping");
+            return None;
+        }
+    };
+
+    Some(root.store_path.as_str().to_string())
+}
+
+/// Fetch a single narinfo, parse it, and return the discovered references as
+/// narinfo S3 keys. Per-node work is pure outside the S3 GET — safe to call
+/// concurrently from a wave.
+async fn fetch_and_parse_narinfo(s3: &S3Client, narinfo_key: String) -> (String, NarinfoOutcome) {
+    let body = match s3.get_object(&narinfo_key).await {
+        Ok(data) => data,
+        Err(e) => {
+            if is_not_found(&e) {
+                tracing::warn!(key = %narinfo_key, "NARinfo not found (404), skipping references");
+            } else {
+                tracing::warn!(key = %narinfo_key, error = %e, "failed to fetch NARinfo, skipping references");
+            }
+            return (narinfo_key, NarinfoOutcome::Dead);
+        }
+    };
+
+    let body_str = match std::str::from_utf8(&body) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(key = %narinfo_key, error = %e, "NARinfo body is not valid UTF-8, skipping");
+            return (narinfo_key, NarinfoOutcome::Dead);
+        }
+    };
+
+    match narinfo::parse_narinfo(body_str) {
+        Ok(info) => {
+            let refs: Vec<String> = info
+                .references
+                .iter()
+                .map(|r| s3_keys::hash_name_to_narinfo_key(r))
+                .collect();
+            (narinfo_key, NarinfoOutcome::Live(refs))
+        }
+        Err(e) => {
+            tracing::warn!(key = %narinfo_key, error = %e, "failed to parse NARinfo, skipping references");
+            (narinfo_key, NarinfoOutcome::Dead)
+        }
+    }
 }
 
 /// Statistics produced by a sweep phase run.
