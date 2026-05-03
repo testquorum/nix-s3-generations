@@ -79,12 +79,18 @@ pub async fn mark_phase(s3: &S3Client) -> Result<HashSet<String>> {
     let gen_keys: Vec<String> = keys.into_iter().filter(|k| k.ends_with(".json")).collect();
     tracing::info!(generation_files = gen_keys.len(), "listed generation files");
 
-    let gc_roots: Vec<String> = stream::iter(gen_keys.into_iter())
+    let gc_root_results: Vec<Result<Option<String>>> = stream::iter(gen_keys.into_iter())
         .map(|key| fetch_generation_root(s3, key))
         .buffer_unordered(MARK_CONCURRENCY)
-        .filter_map(|r| async move { r })
         .collect()
         .await;
+
+    let mut gc_roots: Vec<String> = Vec::new();
+    for r in gc_root_results {
+        if let Some(root) = r? {
+            gc_roots.push(root);
+        }
+    }
 
     tracing::info!(
         gc_roots = gc_roots.len(),
@@ -121,13 +127,14 @@ pub async fn mark_phase(s3: &S3Client) -> Result<HashSet<String>> {
         let wave_size = stack.len();
         dfs_count += wave_size as u64;
 
-        let wave: Vec<(String, NarinfoOutcome)> = stream::iter(stack.drain(..))
+        let wave_results: Vec<Result<(String, NarinfoOutcome)>> = stream::iter(stack.drain(..))
             .map(|key| fetch_and_parse_narinfo(s3, key))
             .buffer_unordered(MARK_CONCURRENCY)
             .collect()
             .await;
 
-        for (key, outcome) in wave {
+        for result in wave_results {
+            let (key, outcome) = result?;
             match outcome {
                 NarinfoOutcome::Live(refs) => {
                     narinfo_states.insert(key, NarinfoState::Live);
@@ -186,14 +193,23 @@ enum NarinfoOutcome {
     Dead,
 }
 
-/// Fetch a single generation JSON and extract its store path. Returns `None`
-/// (with a logged warning) on fetch / parse failure.
-async fn fetch_generation_root(s3: &S3Client, key: String) -> Option<String> {
+/// Fetch a single generation JSON and extract its store path.
+///
+/// Returns `Ok(Some(...))` on success, `Ok(None)` if the object is genuinely
+/// gone (404) or the body is unparseable JSON (genuine corruption — skipped
+/// with a warning). Any other fetch error (network, 5xx, retry exhaustion)
+/// returns `Err`, which the caller propagates to abort the entire prune —
+/// silently dropping a generation root would cause its whole closure to be
+/// deleted in the sweep phase.
+async fn fetch_generation_root(s3: &S3Client, key: String) -> Result<Option<String>> {
     let body = match s3.get_object(&key).await {
         Ok(data) => data,
         Err(e) => {
-            tracing::warn!(key = %key, error = %e, "failed to fetch generation JSON, skipping");
-            return None;
+            if is_not_found(&e) {
+                tracing::warn!(key = %key, "generation JSON not found (404), skipping");
+                return Ok(None);
+            }
+            return Err(e.context(format!("failed to fetch generation JSON {key}")));
         }
     };
 
@@ -201,26 +217,33 @@ async fn fetch_generation_root(s3: &S3Client, key: String) -> Option<String> {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(key = %key, error = %e, "failed to parse generation JSON, skipping");
-            return None;
+            return Ok(None);
         }
     };
 
-    Some(root.store_path.as_str().to_string())
+    Ok(Some(root.store_path.as_str().to_string()))
 }
 
 /// Fetch a single narinfo, parse it, and return the discovered references as
 /// narinfo S3 keys. Per-node work is pure outside the S3 GET — safe to call
 /// concurrently from a wave.
-async fn fetch_and_parse_narinfo(s3: &S3Client, narinfo_key: String) -> (String, NarinfoOutcome) {
+///
+/// `Ok(Dead)` only on a genuine 404 or unparseable body. **Any other fetch
+/// error returns `Err`** so the mark phase can abort: classifying a
+/// transient network failure as `Dead` would cause `sweep_phase` to delete
+/// a live narinfo and its NAR.
+async fn fetch_and_parse_narinfo(
+    s3: &S3Client,
+    narinfo_key: String,
+) -> Result<(String, NarinfoOutcome)> {
     let body = match s3.get_object(&narinfo_key).await {
         Ok(data) => data,
         Err(e) => {
             if is_not_found(&e) {
                 tracing::warn!(key = %narinfo_key, "NARinfo not found (404), skipping references");
-            } else {
-                tracing::warn!(key = %narinfo_key, error = %e, "failed to fetch NARinfo, skipping references");
+                return Ok((narinfo_key, NarinfoOutcome::Dead));
             }
-            return (narinfo_key, NarinfoOutcome::Dead);
+            return Err(e.context(format!("failed to fetch NARinfo {narinfo_key}")));
         }
     };
 
@@ -228,7 +251,7 @@ async fn fetch_and_parse_narinfo(s3: &S3Client, narinfo_key: String) -> (String,
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(key = %narinfo_key, error = %e, "NARinfo body is not valid UTF-8, skipping");
-            return (narinfo_key, NarinfoOutcome::Dead);
+            return Ok((narinfo_key, NarinfoOutcome::Dead));
         }
     };
 
@@ -239,11 +262,11 @@ async fn fetch_and_parse_narinfo(s3: &S3Client, narinfo_key: String) -> (String,
                 .iter()
                 .map(|r| s3_keys::hash_name_to_narinfo_key(r))
                 .collect();
-            (narinfo_key, NarinfoOutcome::Live(refs))
+            Ok((narinfo_key, NarinfoOutcome::Live(refs)))
         }
         Err(e) => {
             tracing::warn!(key = %narinfo_key, error = %e, "failed to parse NARinfo, skipping references");
-            (narinfo_key, NarinfoOutcome::Dead)
+            Ok((narinfo_key, NarinfoOutcome::Dead))
         }
     }
 }
@@ -717,6 +740,86 @@ mod tests {
         let live = mark_phase(&client).await.unwrap();
         assert_eq!(live.len(), 1);
         assert!(live.contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    }
+
+    /// Helper: build N copies of a 500 ReplayEvent. The SDK's default retry
+    /// strategy makes up to 3 attempts on transient errors; provide a generous
+    /// margin so the test exercises retry exhaustion deterministically.
+    fn server_error_events(n: usize) -> Vec<ReplayEvent> {
+        (0..n)
+            .map(|_| {
+                ReplayEvent::new(
+                    empty_request(),
+                    http::Response::builder()
+                        .status(500)
+                        .body(SdkBody::from("internal error"))
+                        .unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn non_404_narinfo_error_aborts_mark_phase() {
+        // Regression: a transient 5xx on a narinfo GET must NOT be classified
+        // as Dead — that would make sweep_phase delete a live narinfo + NAR.
+        let mut events = vec![
+            // list_objects("generations/")
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(generation_list_xml(&[
+                        "generations/dom/1/gen.json",
+                    ])))
+                    .unwrap(),
+            ),
+            // generation JSON
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(generation_json(
+                        "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-pkg-a",
+                    )))
+                    .unwrap(),
+            ),
+        ];
+        events.extend(server_error_events(5));
+        let client = mock_client(events);
+
+        let result = mark_phase(&client).await;
+        assert!(
+            result.is_err(),
+            "non-404 narinfo fetch errors must abort mark_phase to prevent deleting live data"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_404_generation_error_aborts_mark_phase() {
+        // Regression: a transient 5xx on a generation JSON GET must NOT cause
+        // the root to be silently dropped — that would delete the generation's
+        // entire closure in sweep_phase.
+        let mut events = vec![
+            // list_objects("generations/")
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(generation_list_xml(&[
+                        "generations/dom/1/gen.json",
+                    ])))
+                    .unwrap(),
+            ),
+        ];
+        events.extend(server_error_events(5));
+        let client = mock_client(events);
+
+        let result = mark_phase(&client).await;
+        assert!(
+            result.is_err(),
+            "non-404 generation JSON fetch errors must abort mark_phase to prevent deleting live data"
+        );
     }
 
     // ── sweep_phase tests ──────────────────────────────────────────
