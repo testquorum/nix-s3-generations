@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use clap::Args;
+use futures::{StreamExt, TryStreamExt};
 
 use crate::generation::GenerationRoot;
 use crate::s3::S3Client;
@@ -153,21 +154,20 @@ pub async fn run(args: ForgetArgs) -> Result<()> {
 }
 
 async fn list_shards(s3: &S3Client, domain_filter: Option<&HashSet<String>>) -> Result<Vec<Shard>> {
-    let objects = s3.list_objects("generations/").await?;
-    let json_keys: Vec<&String> = objects
-        .iter()
-        .map(|o| &o.key)
-        .filter(|k| k.ends_with(".json"))
-        .collect();
-    tracing::info!(
-        total_keys = objects.len(),
-        json_keys = json_keys.len(),
-        "listed generation objects"
-    );
+    let mut total_keys = 0usize;
+    let mut nr_json_keys = 0usize;
 
-    let mut shards = Vec::with_capacity(json_keys.len());
-    for key in json_keys {
-        let Some((domain, generation, _shard_id)) = s3_keys::parse_generation_key(key) else {
+    let mut keys = s3
+        .list_objects("generations/")
+        .map_ok(|o| o.key)
+        .inspect_ok(|_| total_keys += 1)
+        .try_filter(|k| futures::future::ready(k.ends_with(".json")))
+        .inspect_ok(|_| nr_json_keys += 1)
+        .boxed();
+
+    let mut shards = Vec::new();
+    while let Some(key) = keys.try_next().await? {
+        let Some((domain, generation, _shard_id)) = s3_keys::parse_generation_key(&key) else {
             tracing::warn!(key = key.as_str(), "unrecognised generation key, skipping");
             continue;
         };
@@ -178,7 +178,7 @@ async fn list_shards(s3: &S3Client, domain_filter: Option<&HashSet<String>>) -> 
             continue;
         }
 
-        let body = match s3.get_object(key).await {
+        let body = match s3.get_object(&key).await {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(key = key.as_str(), error = %e, "failed to fetch generation JSON, skipping");
@@ -201,6 +201,13 @@ async fn list_shards(s3: &S3Client, domain_filter: Option<&HashSet<String>>) -> 
             timestamp: root.timestamp,
         });
     }
+    drop(keys);
+
+    tracing::info!(
+        total_keys,
+        json_keys = nr_json_keys,
+        "listed generation objects"
+    );
 
     Ok(shards)
 }
