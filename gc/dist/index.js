@@ -34628,6 +34628,9 @@ async function gcPhase() {
     const forgetBefore = getInput("forget-before");
     if (forgetBefore)
         args.push("--forget-before", forgetBefore);
+    const freshnessBufferSecs = getInput("freshness-buffer-secs");
+    if (freshnessBufferSecs)
+        args.push("--freshness-buffer-secs", freshnessBufferSecs);
     info(`Running forget with args: ${args.join(" ")}`);
     const childEnv = {
         ...process.env,

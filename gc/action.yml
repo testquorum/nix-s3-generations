@@ -38,6 +38,16 @@ inputs:
       now (wall-clock). Same syntax as keep-within. Escape hatch for stale
       domains that no longer push.
     required: false
+  freshness-buffer-secs:
+    description: |
+      Number of seconds before prune start that an object's LastModified
+      must precede for the object to be eligible for deletion. Skips
+      anything more recent. Doubles as a grace period for in-flight pushes
+      that haven't yet written their generation root JSON, and as
+      clock-skew margin between the runner and S3. Default 300 (5 min);
+      raise toward your maximum push duration if you see live data
+      disappearing during prune.
+    required: false
 runs:
   using: "node24"
   main: "./dist/index.js"

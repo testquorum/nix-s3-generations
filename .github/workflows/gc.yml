@@ -24,4 +24,10 @@ jobs:
           region: auto
           aws-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+
+          # Pessimistic — wider than any plausible push duration in this
+          # repo, so a long-running build whose root JSON hasn't landed yet
+          # can't be raced by the scheduled GC.
+          freshness-buffer-secs: "7200"
+
           forget-before: "30d"

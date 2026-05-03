@@ -1,5 +1,6 @@
 use anyhow::Result;
 use aws_sdk_s3::Client;
+use chrono::{DateTime, Utc};
 
 /// S3 client wrapper around `aws-sdk-s3`.
 ///
@@ -8,6 +9,15 @@ use aws_sdk_s3::Client;
 pub struct S3Client {
     client: Client,
     bucket: String,
+}
+
+/// One entry from `list_objects`. `last_modified` is the server-side
+/// `LastModified` reported by S3; `None` only if the listing omits it
+/// (shouldn't happen for `list_objects_v2`, but callers must be defensive).
+#[derive(Debug, Clone)]
+pub struct S3Object {
+    pub key: String,
+    pub last_modified: Option<DateTime<Utc>>,
 }
 
 impl S3Client {
@@ -91,8 +101,10 @@ impl S3Client {
     }
 
     /// List objects with the given prefix. Uses pagination via `into_paginator()`.
-    pub async fn list_objects(&self, prefix: &str) -> Result<Vec<String>> {
-        let mut keys = Vec::new();
+    /// Each entry includes the server-side `LastModified` so callers (notably
+    /// the prune sweep) can filter on object age without a follow-up HEAD.
+    pub async fn list_objects(&self, prefix: &str) -> Result<Vec<S3Object>> {
+        let mut objects = Vec::new();
         let paginator = self
             .client
             .list_objects_v2()
@@ -107,7 +119,10 @@ impl S3Client {
                 Some(Ok(output)) => {
                     for obj in output.contents() {
                         if let Some(key) = obj.key() {
-                            keys.push(key.to_string());
+                            objects.push(S3Object {
+                                key: key.to_string(),
+                                last_modified: obj.last_modified().and_then(smithy_to_chrono),
+                            });
                         }
                     }
                 }
@@ -115,7 +130,7 @@ impl S3Client {
                 None => break,
             }
         }
-        Ok(keys)
+        Ok(objects)
     }
 
     /// Get an object by key. Returns the object body as bytes.
@@ -142,6 +157,14 @@ impl S3Client {
             .await?;
         Ok(())
     }
+}
+
+/// Convert the AWS SDK's `DateTime` (S3's object-level `LastModified` from
+/// the `ListObjectsV2` response) into a `chrono::DateTime<Utc>`. Returns
+/// `None` if the value is outside chrono's representable range — which it
+/// never is for real S3 timestamps.
+fn smithy_to_chrono(dt: &aws_sdk_s3::primitives::DateTime) -> Option<DateTime<Utc>> {
+    DateTime::<Utc>::from_timestamp(dt.secs(), dt.subsec_nanos())
 }
 
 #[cfg(test)]
@@ -250,9 +273,11 @@ mod tests {
 <ListBucketResult>
   <Contents>
     <Key>prefix/key1</Key>
+    <LastModified>2026-01-01T00:00:00.000Z</LastModified>
   </Contents>
   <Contents>
     <Key>prefix/key2</Key>
+    <LastModified>2026-01-02T00:00:00.000Z</LastModified>
   </Contents>
 </ListBucketResult>"#;
         let client = mock_client(vec![ReplayEvent::new(
@@ -263,8 +288,12 @@ mod tests {
                 .unwrap(),
         )]);
 
-        let keys = client.list_objects("prefix/").await.unwrap();
+        let objects = client.list_objects("prefix/").await.unwrap();
+        let keys: Vec<&str> = objects.iter().map(|o| o.key.as_str()).collect();
         assert_eq!(keys, vec!["prefix/key1", "prefix/key2"]);
+        assert!(objects[0].last_modified.is_some());
+        assert!(objects[1].last_modified.is_some());
+        assert!(objects[0].last_modified.unwrap() < objects[1].last_modified.unwrap());
     }
 
     #[tokio::test]
@@ -280,8 +309,8 @@ mod tests {
                 .unwrap(),
         )]);
 
-        let keys = client.list_objects("prefix/").await.unwrap();
-        assert!(keys.is_empty());
+        let objects = client.list_objects("prefix/").await.unwrap();
+        assert!(objects.is_empty());
     }
 
     #[tokio::test]
@@ -290,6 +319,7 @@ mod tests {
 <ListBucketResult>
   <Contents>
     <Key>prefix/key1</Key>
+    <LastModified>2026-01-01T00:00:00.000Z</LastModified>
   </Contents>
   <NextContinuationToken>token123</NextContinuationToken>
 </ListBucketResult>"#;
@@ -297,6 +327,7 @@ mod tests {
 <ListBucketResult>
   <Contents>
     <Key>prefix/key2</Key>
+    <LastModified>2026-01-02T00:00:00.000Z</LastModified>
   </Contents>
 </ListBucketResult>"#;
         let client = mock_client(vec![
@@ -316,7 +347,8 @@ mod tests {
             ),
         ]);
 
-        let keys = client.list_objects("prefix/").await.unwrap();
+        let objects = client.list_objects("prefix/").await.unwrap();
+        let keys: Vec<&str> = objects.iter().map(|o| o.key.as_str()).collect();
         assert_eq!(keys, vec!["prefix/key1", "prefix/key2"]);
     }
 
