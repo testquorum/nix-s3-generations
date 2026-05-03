@@ -148,7 +148,9 @@
           );
         };
 
-        npmDepsHash = "sha256-m0QtbzuwfZckjbki9jwgBRGkJv93IrJ5/ERDlRRJRhs=";
+        npmDeps = pkgs.importNpmLock {
+          npmRoot = ./.;
+        };
 
         tsCheck =
           name: buildPhase:
@@ -156,7 +158,8 @@
             pname = "nix-s3-generations-${name}";
             version = "0.1.0";
             src = tsSrc;
-            inherit npmDepsHash;
+            inherit npmDeps;
+            npmConfigHook = pkgs.importNpmLock.npmConfigHook;
             dontNpmBuild = true;
             inherit buildPhase;
             installPhase = "touch $out";
@@ -173,7 +176,8 @@
             pname = "nix-s3-generations-dist-${name}";
             version = "0.1.0";
             inherit src;
-            inherit npmDepsHash;
+            inherit npmDeps;
+            npmConfigHook = pkgs.importNpmLock.npmConfigHook;
             dontNpmBuild = true;
             buildPhase = ''
               runHook preBuild
