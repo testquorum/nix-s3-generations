@@ -16,6 +16,7 @@ chrono = { version = "0.4", features = ["serde"] }
 humantime = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+async-stream = "0.3.6"
 
 [dev-dependencies]
 aws-smithy-http-client = { version = "1", features = ["test-util"] }

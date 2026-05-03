@@ -1,6 +1,8 @@
 use anyhow::Result;
+use async_stream::stream;
 use aws_sdk_s3::Client;
 use chrono::{DateTime, Utc};
+use futures::Stream;
 
 /// S3 client wrapper around `aws-sdk-s3`.
 ///
@@ -103,8 +105,7 @@ impl S3Client {
     /// List objects with the given prefix. Uses pagination via `into_paginator()`.
     /// Each entry includes the server-side `LastModified` so callers (notably
     /// the prune sweep) can filter on object age without a follow-up HEAD.
-    pub async fn list_objects(&self, prefix: &str) -> Result<Vec<S3Object>> {
-        let mut objects = Vec::new();
+    pub fn list_objects(&self, prefix: &str) -> impl Stream<Item = Result<S3Object>> {
         let paginator = self
             .client
             .list_objects_v2()
@@ -112,25 +113,29 @@ impl S3Client {
             .prefix(prefix)
             .into_paginator();
 
-        let mut stream = paginator.send();
+        let mut pages = paginator.send();
 
-        loop {
-            match stream.next().await {
-                Some(Ok(output)) => {
-                    for obj in output.contents() {
-                        if let Some(key) = obj.key() {
-                            objects.push(S3Object {
-                                key: key.to_string(),
-                                last_modified: obj.last_modified().and_then(smithy_to_chrono),
-                            });
+        stream! {
+            loop {
+                match pages.next().await {
+                    Some(Ok(output)) => {
+                        for obj in output.contents() {
+                            if let Some(key) = obj.key() {
+                                yield Ok(S3Object {
+                                    key: key.to_string(),
+                                    last_modified: obj.last_modified().and_then(smithy_to_chrono),
+                                });
+                            }
                         }
                     }
+                    Some(Err(e)) => {
+                        yield Err(e.into());
+                        break;
+                    },
+                    None => break,
                 }
-                Some(Err(e)) => return Err(e.into()),
-                None => break,
             }
         }
-        Ok(objects)
     }
 
     /// Get an object by key. Returns the object body as bytes.
@@ -173,6 +178,7 @@ mod tests {
     use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
     use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
     use aws_smithy_types::body::SdkBody;
+    use futures::TryStreamExt;
 
     /// Helper to create an `S3Client` wired to a `StaticReplayClient`.
     fn mock_client(events: Vec<ReplayEvent>) -> S3Client {
@@ -288,7 +294,7 @@ mod tests {
                 .unwrap(),
         )]);
 
-        let objects = client.list_objects("prefix/").await.unwrap();
+        let objects: Vec<S3Object> = client.list_objects("prefix/").try_collect().await.unwrap();
         let keys: Vec<&str> = objects.iter().map(|o| o.key.as_str()).collect();
         assert_eq!(keys, vec!["prefix/key1", "prefix/key2"]);
         assert!(objects[0].last_modified.is_some());
@@ -309,7 +315,7 @@ mod tests {
                 .unwrap(),
         )]);
 
-        let objects = client.list_objects("prefix/").await.unwrap();
+        let objects: Vec<S3Object> = client.list_objects("prefix/").try_collect().await.unwrap();
         assert!(objects.is_empty());
     }
 
@@ -347,7 +353,7 @@ mod tests {
             ),
         ]);
 
-        let objects = client.list_objects("prefix/").await.unwrap();
+        let objects: Vec<S3Object> = client.list_objects("prefix/").try_collect().await.unwrap();
         let keys: Vec<&str> = objects.iter().map(|o| o.key.as_str()).collect();
         assert_eq!(keys, vec!["prefix/key1", "prefix/key2"]);
     }

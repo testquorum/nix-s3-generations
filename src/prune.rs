@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use clap::Args;
-use futures::stream::{self, StreamExt};
+use futures::stream::{self, StreamExt, TryStreamExt};
 
 use crate::generation::GenerationRoot;
 use crate::narinfo;
@@ -104,27 +104,22 @@ enum NarinfoState {
 ///    live path.
 pub async fn mark_phase(s3: &S3Client) -> Result<HashSet<String>> {
     tracing::info!("listing generation objects under generations/");
-    let objects = s3.list_objects("generations/").await?;
 
-    let gen_keys: Vec<String> = objects
-        .into_iter()
-        .map(|o| o.key)
-        .filter(|k| k.ends_with(".json"))
-        .collect();
-    tracing::info!(generation_files = gen_keys.len(), "listed generation files");
+    let mut generation_files = 0usize;
+    let gen_keys = s3
+        .list_objects("generations/")
+        .map_ok(|o| o.key)
+        .try_filter(|k| futures::future::ready(k.ends_with(".json")))
+        .inspect_ok(|_| generation_files += 1);
 
-    let gc_root_results: Vec<Result<Option<String>>> = stream::iter(gen_keys.into_iter())
-        .map(|key| fetch_generation_root(s3, key))
-        .buffer_unordered(MARK_CONCURRENCY)
-        .collect()
-        .await;
+    let gc_roots: Vec<String> = gen_keys
+        .map_ok(|key| fetch_generation_root(s3, key))
+        .try_buffer_unordered(MARK_CONCURRENCY)
+        .try_filter_map(|opt| async move { Ok(opt) })
+        .try_collect()
+        .await?;
 
-    let mut gc_roots: Vec<String> = Vec::new();
-    for r in gc_root_results {
-        if let Some(root) = r? {
-            gc_roots.push(root);
-        }
-    }
+    tracing::info!(generation_files, "listed generation files");
 
     tracing::info!(
         gc_roots = gc_roots.len(),
@@ -343,41 +338,42 @@ pub async fn sweep_phase(
     dry_run: bool,
 ) -> Result<PruneStats> {
     tracing::info!("listing all objects in bucket for sweep phase");
-    let objects = s3.list_objects("").await?;
+    let objects = s3.list_objects("");
 
     // Narinfo candidates that *might* be eligible for deletion: must be a
     // narinfo key, and must predate the prune-start cutoff. Items modified
     // at-or-after the cutoff (or with no `LastModified` in the listing)
     // could belong to an in-flight push whose generation root hasn't landed
     // yet, so we filter them out here rather than risk deleting them.
-    let narinfo_objects: Vec<&crate::s3::S3Object> = objects
-        .iter()
-        .filter(|o| s3_keys::is_narinfo_key(&o.key))
-        .filter(|o| match o.last_modified {
-            Some(lm) if lm < prune_start_at => true,
-            Some(lm) => {
-                tracing::info!(
-                    key = o.key.as_str(),
-                    last_modified = %lm,
-                    cutoff = %prune_start_at,
-                    "skipping recently-modified narinfo (freshness filter)"
-                );
-                false
-            }
-            None => {
-                tracing::warn!(
-                    key = o.key.as_str(),
-                    "narinfo has no LastModified in listing, skipping defensively"
-                );
-                false
-            }
+    let mut narinfo_objects = objects
+        .try_filter(|o| futures::future::ready(s3_keys::is_narinfo_key(&o.key)))
+        .try_filter(|o| {
+            futures::future::ready(match o.last_modified {
+                Some(lm) if lm < prune_start_at => true,
+                Some(lm) => {
+                    tracing::info!(
+                        key = o.key.as_str(),
+                        last_modified = %lm,
+                        cutoff = %prune_start_at,
+                        "skipping recently-modified narinfo (freshness filter)"
+                    );
+                    false
+                }
+                None => {
+                    tracing::warn!(
+                        key = o.key.as_str(),
+                        "narinfo has no LastModified in listing, skipping defensively"
+                    );
+                    false
+                }
+            })
         })
-        .collect();
+        .boxed();
 
     let mut stats = PruneStats::default();
     let mut sweep_count = 0usize;
 
-    for obj in &narinfo_objects {
+    while let Some(obj) = narinfo_objects.try_next().await? {
         let key = &obj.key;
         sweep_count += 1;
         stats.narinfos_checked += 1;
