@@ -3,11 +3,14 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use clap::Args;
-use futures::{StreamExt, TryStreamExt};
+use futures::{Stream, TryStreamExt};
 
 use crate::generation::GenerationRoot;
 use crate::s3::S3Client;
 use crate::s3_keys;
+
+/// Maximum number of concurrent S3 GETs while listing generation shards.
+const LIST_SHARDS_CONCURRENCY: usize = 32;
 
 #[derive(Args, Debug, Clone)]
 pub struct ForgetArgs {
@@ -107,7 +110,10 @@ pub async fn run(args: ForgetArgs) -> Result<()> {
         Some(args.domain.iter().cloned().collect())
     };
 
-    let shards = list_shards(&s3, domain_filter.as_ref()).await?;
+    let shards: Vec<Shard> = list_shards(&s3, domain_filter.as_ref())
+        .try_collect()
+        .await?;
+    tracing::info!(shards = shards.len(), "listed generation shards");
     let now = Utc::now();
 
     let (forgotten, stats) = select_forgotten(&shards, &args, now);
@@ -153,63 +159,56 @@ pub async fn run(args: ForgetArgs) -> Result<()> {
     Ok(())
 }
 
-async fn list_shards(s3: &S3Client, domain_filter: Option<&HashSet<String>>) -> Result<Vec<Shard>> {
-    let mut total_keys = 0usize;
-    let mut nr_json_keys = 0usize;
-
-    let mut keys = s3
-        .list_objects("generations/")
+fn list_shards<'a>(
+    s3: &'a S3Client,
+    domain_filter: Option<&'a HashSet<String>>,
+) -> impl Stream<Item = Result<Shard>> + 'a {
+    s3.list_objects("generations/")
         .map_ok(|o| o.key)
-        .inspect_ok(|_| total_keys += 1)
         .try_filter(|k| futures::future::ready(k.ends_with(".json")))
-        .inspect_ok(|_| nr_json_keys += 1)
-        .boxed();
+        .try_filter_map(move |key| async move {
+            let Some((domain, generation, _shard_id)) = s3_keys::parse_generation_key(&key) else {
+                tracing::warn!(key = key.as_str(), "unrecognised generation key, skipping");
+                return Ok(None);
+            };
+            if let Some(filter) = domain_filter
+                && !filter.contains(&domain)
+            {
+                return Ok(None);
+            }
+            Ok(Some((key, domain, generation)))
+        })
+        .map_ok(move |(key, domain, generation)| fetch_and_parse_shard(s3, key, domain, generation))
+        .try_buffer_unordered(LIST_SHARDS_CONCURRENCY)
+        .try_filter_map(|opt| async move { Ok(opt) })
+}
 
-    let mut shards = Vec::new();
-    while let Some(key) = keys.try_next().await? {
-        let Some((domain, generation, _shard_id)) = s3_keys::parse_generation_key(&key) else {
-            tracing::warn!(key = key.as_str(), "unrecognised generation key, skipping");
-            continue;
-        };
-
-        if let Some(filter) = domain_filter
-            && !filter.contains(&domain)
-        {
-            continue;
+async fn fetch_and_parse_shard(
+    s3: &S3Client,
+    key: String,
+    domain: String,
+    generation: u64,
+) -> Result<Option<Shard>> {
+    let body = match s3.get_object(&key).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(key = key.as_str(), error = %e, "failed to fetch generation JSON, skipping");
+            return Ok(None);
         }
-
-        let body = match s3.get_object(&key).await {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(key = key.as_str(), error = %e, "failed to fetch generation JSON, skipping");
-                continue;
-            }
-        };
-
-        let root: GenerationRoot = match serde_json::from_slice(&body) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(key = key.as_str(), error = %e, "failed to parse generation JSON, skipping");
-                continue;
-            }
-        };
-
-        shards.push(Shard {
-            key: key.clone(),
-            domain,
-            generation,
-            timestamp: root.timestamp,
-        });
-    }
-    drop(keys);
-
-    tracing::info!(
-        total_keys,
-        json_keys = nr_json_keys,
-        "listed generation objects"
-    );
-
-    Ok(shards)
+    };
+    let root: GenerationRoot = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(key = key.as_str(), error = %e, "failed to parse generation JSON, skipping");
+            return Ok(None);
+        }
+    };
+    Ok(Some(Shard {
+        key,
+        domain,
+        generation,
+        timestamp: root.timestamp,
+    }))
 }
 
 /// Apply `--forget-before` (phase 1) followed by per-domain keep policies
@@ -651,7 +650,7 @@ mod tests {
         ]);
         let mut filter = HashSet::new();
         filter.insert("keep".to_string());
-        let shards = list_shards(&s3, Some(&filter)).await.unwrap();
+        let shards: Vec<Shard> = list_shards(&s3, Some(&filter)).try_collect().await.unwrap();
         assert_eq!(shards.len(), 1);
         assert_eq!(shards[0].domain, "keep");
     }
@@ -694,7 +693,7 @@ mod tests {
             ),
         ]);
 
-        let shards = list_shards(&s3, None).await.unwrap();
+        let shards: Vec<Shard> = list_shards(&s3, None).try_collect().await.unwrap();
         assert_eq!(shards.len(), 2);
 
         let now = d(2026, 5, 1);
