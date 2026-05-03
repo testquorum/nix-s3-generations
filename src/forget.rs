@@ -45,6 +45,13 @@ pub struct ForgetArgs {
     #[arg(long, default_value = "false")]
     pub prune: bool,
 
+    /// Forwarded to `prune --freshness-buffer-secs` when `--prune` is set.
+    /// Skip deletion of any object whose `LastModified` is within this many
+    /// seconds of prune start. Defaults to the same value `prune` uses on
+    /// its own; tune higher when push durations exceed the default.
+    #[arg(long, default_value_t = crate::prune::DEFAULT_FRESHNESS_BUFFER_SECS)]
+    pub freshness_buffer_secs: u64,
+
     #[arg(long, default_value = "false")]
     pub dry_run: bool,
 }
@@ -137,6 +144,7 @@ pub async fn run(args: ForgetArgs) -> Result<()> {
             region: args.region,
             endpoint: args.endpoint,
             dry_run: args.dry_run,
+            freshness_buffer_secs: args.freshness_buffer_secs,
         };
         crate::prune::run(prune_args).await?;
     }
@@ -145,10 +153,14 @@ pub async fn run(args: ForgetArgs) -> Result<()> {
 }
 
 async fn list_shards(s3: &S3Client, domain_filter: Option<&HashSet<String>>) -> Result<Vec<Shard>> {
-    let keys = s3.list_objects("generations/").await?;
-    let json_keys: Vec<&String> = keys.iter().filter(|k| k.ends_with(".json")).collect();
+    let objects = s3.list_objects("generations/").await?;
+    let json_keys: Vec<&String> = objects
+        .iter()
+        .map(|o| &o.key)
+        .filter(|k| k.ends_with(".json"))
+        .collect();
     tracing::info!(
-        total_keys = keys.len(),
+        total_keys = objects.len(),
         json_keys = json_keys.len(),
         "listed generation objects"
     );
@@ -314,6 +326,7 @@ mod tests {
             keep_within,
             forget_before,
             prune: false,
+            freshness_buffer_secs: crate::prune::DEFAULT_FRESHNESS_BUFFER_SECS,
             dry_run: false,
         }
     }

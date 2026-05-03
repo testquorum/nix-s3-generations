@@ -58,6 +58,10 @@ async function gcPhase(): Promise<void> {
   const forgetBefore = core.getInput("forget-before");
   if (forgetBefore) args.push("--forget-before", forgetBefore);
 
+  const freshnessBufferSecs = core.getInput("freshness-buffer-secs");
+  if (freshnessBufferSecs)
+    args.push("--freshness-buffer-secs", freshnessBufferSecs);
+
   core.info(`Running forget with args: ${args.join(" ")}`);
 
   const childEnv: Record<string, string> = {
