@@ -65,6 +65,37 @@ fn load_snapshot(path: &Path) -> Result<HashSet<StorePath>> {
         .with_context(|| format!("failed to parse snapshot JSON from: {}", path.display()))
 }
 
+/// True for AWS-native S3 endpoints, where Nix's `s3://` substituter URI
+/// must omit the `endpoint=` parameter (the SDK's default endpoint
+/// resolution applies). Mirrors `isNativeAws` in
+/// `action/helpers.ts:buildNixS3Params`.
+fn is_native_aws_endpoint(endpoint: &str) -> bool {
+    if endpoint == "s3.amazonaws.com" {
+        return true;
+    }
+    if let Some(rest) = endpoint.strip_prefix("s3.")
+        && let Some(region) = rest.strip_suffix(".amazonaws.com")
+    {
+        return !region.is_empty() && !region.contains('.');
+    }
+    false
+}
+
+/// Build the destination URI for `nix copy --to` used by the restoration
+/// pass. No `secret-key` is appended: the restoration pass only re-uploads
+/// narinfos a racing prune deleted, and those paths were already signed
+/// by the post-build hook on their original upload (the hook is required
+/// to be installed — see the bail at the top of `run`). `nix copy`
+/// without `secret-key` preserves the existing local-store signatures
+/// rather than replacing them.
+fn build_copy_uri(bucket: &str, region: &str, endpoint: Option<&str>) -> String {
+    let s3_params = match endpoint {
+        Some(ep) if !is_native_aws_endpoint(ep) => format!("endpoint={ep}&region={region}"),
+        _ => format!("region={region}"),
+    };
+    format!("s3://{bucket}?{s3_params}&compression=zstd")
+}
+
 pub async fn run(args: PushArgs) -> Result<()> {
     // Refuse to run without our post-build hook installed. The hook is what
     // signs and uploads each build's closure as it lands; without it, this
@@ -106,9 +137,13 @@ pub async fn run(args: PushArgs) -> Result<()> {
         "computed minimal cover of new paths"
     );
 
-    let s3_client = S3Client::new(args.bucket.clone(), args.region.clone(), args.endpoint)
-        .await
-        .context("failed to create S3 client")?;
+    let s3_client = S3Client::new(
+        args.bucket.clone(),
+        args.region.clone(),
+        args.endpoint.clone(),
+    )
+    .await
+    .context("failed to create S3 client")?;
 
     tracing::info!(
         cover = cover.len(),
@@ -150,7 +185,24 @@ pub async fn run(args: PushArgs) -> Result<()> {
         .await
         .context("failed to upload generation root")?;
 
-    tracing::info!(key = %gen_key, "Push complete. Generation root uploaded.");
+    tracing::info!(key = %gen_key, "generation root uploaded");
+
+    // Restoration pass. A prune whose mark phase ran before this run's gen
+    // root JSON landed will not include this run's closure in its live set;
+    // its sweep then deletes any narinfo whose `LastModified` predates
+    // `prune_start_at - freshness_buffer_secs`. Re-running `nix copy` on
+    // the closure root walks the closure, HEADs each path, and re-uploads
+    // any narinfo that has gone missing — restoring the cache to the
+    // state the gen root claims. Existing narinfos are skipped, so this
+    // doesn't refresh `LastModified` on healthy paths.
+    let copy_uri = build_copy_uri(&args.bucket, &args.region, args.endpoint.as_deref());
+    tracing::info!(
+        %closure_root,
+        "restoration pass: re-running nix copy on closure root to re-upload any narinfos a racing prune deleted",
+    );
+    nix::copy_paths_real(&copy_uri, &closure_root)
+        .context("restoration pass failed: nix copy on closure root after gen root upload")?;
+    tracing::info!("Push complete. Closure restoration pass complete.");
 
     Ok(())
 }
@@ -251,5 +303,64 @@ mod tests {
     fn validate_shard_id_rejects_dot_traversal() {
         assert!(validate_shard_id(".").is_err());
         assert!(validate_shard_id("..").is_err());
+    }
+
+    // Mirrors `buildNixS3Params` cases in `action/__tests__/nix-conf.test.ts`.
+    // The two implementations must agree because the post-build hook (action
+    // side) and the restoration pass (this binary) hand the resulting URI
+    // to the same `nix copy --to`.
+
+    #[test]
+    fn is_native_aws_endpoint_global_endpoint() {
+        assert!(is_native_aws_endpoint("s3.amazonaws.com"));
+    }
+
+    #[test]
+    fn is_native_aws_endpoint_regional_endpoints() {
+        assert!(is_native_aws_endpoint("s3.us-east-1.amazonaws.com"));
+        assert!(is_native_aws_endpoint("s3.eu-west-1.amazonaws.com"));
+    }
+
+    #[test]
+    fn is_native_aws_endpoint_rejects_third_party() {
+        assert!(!is_native_aws_endpoint("abc.r2.cloudflarestorage.com"));
+        assert!(!is_native_aws_endpoint("minio.local"));
+        assert!(!is_native_aws_endpoint(""));
+    }
+
+    #[test]
+    fn is_native_aws_endpoint_rejects_subdomain_lookalikes() {
+        // `s3.foo.bar.amazonaws.com` is not the regional form; the region
+        // segment must not contain dots.
+        assert!(!is_native_aws_endpoint("s3.foo.bar.amazonaws.com"));
+        // No region between `s3.` and `.amazonaws.com`.
+        assert!(!is_native_aws_endpoint("s3..amazonaws.com"));
+    }
+
+    #[test]
+    fn build_copy_uri_native_aws_omits_endpoint_param() {
+        let uri = build_copy_uri("my-bucket", "us-east-1", Some("s3.amazonaws.com"));
+        assert_eq!(uri, "s3://my-bucket?region=us-east-1&compression=zstd");
+    }
+
+    #[test]
+    fn build_copy_uri_regional_aws_omits_endpoint_param() {
+        let uri = build_copy_uri("b", "eu-west-1", Some("s3.eu-west-1.amazonaws.com"));
+        assert_eq!(uri, "s3://b?region=eu-west-1&compression=zstd");
+    }
+
+    #[test]
+    fn build_copy_uri_no_endpoint_omits_endpoint_param() {
+        let uri = build_copy_uri("b", "us-east-1", None);
+        assert_eq!(uri, "s3://b?region=us-east-1&compression=zstd");
+    }
+
+    #[test]
+    fn build_copy_uri_third_party_includes_endpoint_param() {
+        let uri = build_copy_uri("b", "auto", Some("abc.r2.cloudflarestorage.com"));
+        assert_eq!(
+            uri,
+            "s3://b?endpoint=abc.r2.cloudflarestorage.com&region=auto&compression=zstd"
+        );
     }
 }
