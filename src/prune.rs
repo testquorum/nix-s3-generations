@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use clap::Args;
 use futures::stream::{self, StreamExt, TryStreamExt};
 
+use crate::coordination::{self, AttemptStatus, PruneAttempt, PushConflict};
 use crate::generation::GenerationRoot;
 use crate::narinfo;
 use crate::s3::S3Client;
@@ -12,6 +13,22 @@ use crate::s3_keys;
 
 /// Maximum number of concurrent S3 GETs per mark-phase wave.
 const MARK_CONCURRENCY: usize = 32;
+
+/// How many dead narinfos to delete per batch before polling for conflicts.
+/// Smaller batches = more responsive to conflicts but more LIST overhead per
+/// pruned hash. 50 trades that off: at typical per-object S3 latencies a
+/// batch is a few seconds, and one extra LIST per batch is single-digit
+/// percent overhead.
+const DELETE_BATCH_SIZE: usize = 50;
+
+/// How long a finalized prune attempt's marker (and its conflict files)
+/// remains in S3 before the janitor deletes it. Set comfortably longer
+/// than the longest expected push duration — markers must remain visible
+/// across the full pre-check / upload / post-check window of any push
+/// that overlapped with the attempt, otherwise post-check could miss it.
+/// 7 days is plenty for typical pushes (minutes) and survives an entire
+/// CI weekend's-worth of activity on small markers.
+const JANITOR_AGE_SECS: i64 = 7 * 24 * 60 * 60;
 
 /// Default freshness buffer (seconds): objects whose `LastModified` is within
 /// this window of prune start are protected from sweep. Doubles as
@@ -67,9 +84,24 @@ pub async fn run(args: PruneArgs) -> Result<()> {
         "starting prune",
     );
 
+    // Best-effort: GC long-finalized prune attempt markers (and their
+    // orphaned conflict files) before doing real work. Failures are
+    // logged and tolerated — a transient janitor error must not stop a
+    // prune from running.
+    if let Err(e) = janitor_phase(&s3, JANITOR_AGE_SECS, args.dry_run).await {
+        tracing::warn!(error = %e, "janitor_phase failed, continuing with prune");
+    }
+
     let live_hashes = mark_phase(&s3).await?;
 
-    let stats = sweep_phase(&s3, &live_hashes, prune_start_at, args.dry_run).await?;
+    let stats = run_pruning(
+        &s3,
+        &live_hashes,
+        prune_start_at,
+        DELETE_BATCH_SIZE,
+        args.dry_run,
+    )
+    .await?;
 
     tracing::info!(
         narinfos_checked = stats.narinfos_checked,
@@ -308,43 +340,59 @@ pub struct PruneStats {
     pub nars_deleted: usize,
 }
 
-/// Delete unreachable narinfo + NAR pairs.
+impl PruneStats {
+    fn merge(&mut self, other: PruneStats) {
+        self.narinfos_checked += other.narinfos_checked;
+        self.narinfos_deleted += other.narinfos_deleted;
+        self.nars_deleted += other.nars_deleted;
+    }
+}
+
+/// Outcome of a single prune *attempt*. The same prune CLI invocation may
+/// run multiple sequential attempts: each time a conflict is honoured the
+/// current attempt yields and a fresh attempt is published with the
+/// conflicted hashes removed.
+#[derive(Debug)]
+enum AttemptOutcome {
+    /// All hashes in the published delete_set were processed (deleted, or
+    /// bypassed because their narinfo no longer existed). Caller finalizes
+    /// the attempt and stops looping.
+    Drained { stats: PruneStats },
+    /// One or more pushers' conflict notices overlapped with our remaining
+    /// delete set. Caller finalizes this attempt and spawns a fresh one
+    /// with `remaining` (the conflicted hashes already subtracted).
+    Yielded {
+        remaining: Vec<String>,
+        stats: PruneStats,
+    },
+}
+
+/// Result of [`compute_delete_set`].
+#[derive(Debug, Default)]
+pub struct DeleteSetCandidates {
+    /// Hashes that need deletion.
+    pub delete_set: Vec<String>,
+    /// Total narinfos scanned (live + dead + guardrail-skipped). Folded
+    /// into `PruneStats::narinfos_checked` so the published stats are a
+    /// scan-size metric, matching the pre-coordination behaviour.
+    pub scanned: usize,
+}
+
+/// List the bucket and return the candidate hash set for sweep — narinfos
+/// whose hash is not in `live_hashes`, that pass the freshness filter, and
+/// that aren't excluded by guardrails.
 ///
-/// 1. List ALL objects in the bucket.
-/// 2. Filter to narinfo keys whose `LastModified` predates
-///    `prune_start_at` — anything more recent (or missing a
-///    `LastModified` entirely) might belong to an in-flight push whose
-///    generation root hasn't landed yet, so we exclude it from the
-///    candidate set up-front.
-/// 3. For each remaining narinfo whose hash (key without `.narinfo`) is
-///    **not** in `live_hashes`:
-///    - **Guardrails**: skip keys starting with `generations/` or equal to
-///      `nix-cache-info`.
-///    - `dry_run`: log and increment counters without deleting.
-///    - otherwise: fetch the narinfo body, parse the `URL` field, validate
-///      with [`s3_keys::sanitize_nar_url`], then delete the **NAR first**
-///      and the narinfo only if the NAR delete succeeded.
-/// 4. If the narinfo body cannot be fetched or parsed there's no NAR key to
-///    delete; the narinfo key is deleted on its own (we know it's dead).
-///
-/// The "NAR before narinfo" order preserves the invariant
-/// *"if a narinfo exists, its NAR exists"* — important because `nix copy`
-/// HEADs the narinfo to decide whether to skip uploading. A half-deleted
-/// pair would otherwise serve a dangling reference until the next sweep.
-pub async fn sweep_phase(
+/// Materializing the set (vs. streaming) is required so we can publish it
+/// to S3 as the prune attempt's `delete_set` for pushers to consult before
+/// any deletes start.
+pub async fn compute_delete_set(
     s3: &S3Client,
     live_hashes: &HashSet<String>,
     prune_start_at: DateTime<Utc>,
-    dry_run: bool,
-) -> Result<PruneStats> {
-    tracing::info!("listing all objects in bucket for sweep phase");
+) -> Result<DeleteSetCandidates> {
+    tracing::info!("listing all objects in bucket to compute delete set");
     let objects = s3.list_objects("");
 
-    // Narinfo candidates that *might* be eligible for deletion: must be a
-    // narinfo key, and must predate the prune-start cutoff. Items modified
-    // at-or-after the cutoff (or with no `LastModified` in the listing)
-    // could belong to an in-flight push whose generation root hasn't landed
-    // yet, so we filter them out here rather than risk deleting them.
     let mut narinfo_objects = objects
         .try_filter(|o| futures::future::ready(s3_keys::is_narinfo_key(&o.key)))
         .try_filter(|o| {
@@ -370,27 +418,10 @@ pub async fn sweep_phase(
         })
         .boxed();
 
-    let mut stats = PruneStats::default();
-    let mut sweep_count = 0usize;
-
+    let mut out = DeleteSetCandidates::default();
     while let Some(obj) = narinfo_objects.try_next().await? {
         let key = &obj.key;
-        sweep_count += 1;
-        stats.narinfos_checked += 1;
-
-        if sweep_count.is_multiple_of(100) {
-            tracing::info!(
-                "sweep: processed {} narinfos, {} deleted",
-                sweep_count,
-                stats.narinfos_deleted
-            );
-        }
-
-        let hash = key.strip_suffix(".narinfo").unwrap_or(key);
-
-        if live_hashes.contains(hash) {
-            continue;
-        }
+        out.scanned += 1;
 
         // --- Guardrails ---
         if key.starts_with("generations/") {
@@ -398,6 +429,10 @@ pub async fn sweep_phase(
                 key = key.as_str(),
                 "skipping generations/ narinfo (guardrail)"
             );
+            continue;
+        }
+        if s3_keys::is_meta_key(key) {
+            tracing::warn!(key = key.as_str(), "skipping meta/ key (guardrail)");
             continue;
         }
         if key.as_str() == "nix-cache-info" {
@@ -408,93 +443,480 @@ pub async fn sweep_phase(
             continue;
         }
 
-        if dry_run {
-            tracing::info!(key = key.as_str(), "[DRY RUN] would delete narinfo + NAR");
-            stats.narinfos_deleted += 1;
-            stats.nars_deleted += 1;
+        let hash = key.strip_suffix(".narinfo").unwrap_or(key);
+        if live_hashes.contains(hash) {
             continue;
         }
+        out.delete_set.push(hash.to_string());
+    }
 
-        // --- Resolve the NAR key from the narinfo body. ---
-        let nar_key_opt: Option<String> = match s3.get_object(key).await {
-            Ok(data) => match std::str::from_utf8(&data) {
-                Ok(body_str) => match narinfo::parse_narinfo(body_str) {
-                    Ok(info) => match s3_keys::sanitize_nar_url(&info.url) {
-                        Ok(url) => Some(url),
-                        Err(e) => {
-                            tracing::warn!(key = key.as_str(), url = %info.url, error = %e, "dead narinfo has invalid URL, no NAR to delete");
-                            None
+    tracing::info!(
+        scanned = out.scanned,
+        candidates = out.delete_set.len(),
+        "computed delete set for sweep"
+    );
+    Ok(out)
+}
+
+/// Read every conflict file under an attempt's `conflicts/` prefix and
+/// return the union of their `claim` hashes intersected with `remaining`.
+///
+/// Bad/unparseable conflict files are logged and ignored (defensively: a
+/// pusher uploading garbage shouldn't be able to halt prune — better to
+/// race them than to deadlock).
+async fn fetch_conflict_overlap(
+    s3: &S3Client,
+    conflicts_prefix: &str,
+    remaining: &HashSet<String>,
+) -> Result<HashSet<String>> {
+    let mut listing = s3.list_objects(conflicts_prefix).boxed();
+    let mut overlap: HashSet<String> = HashSet::new();
+    while let Some(obj) = listing.try_next().await? {
+        if !obj.key.ends_with(".json") {
+            continue;
+        }
+        match s3.get_object(&obj.key).await {
+            Ok(data) => match serde_json::from_slice::<PushConflict>(&data) {
+                Ok(c) => {
+                    for h in c.claim {
+                        if remaining.contains(&h) {
+                            overlap.insert(h);
                         }
-                    },
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    key = %obj.key,
+                    error = %e,
+                    "failed to parse conflict file, ignoring"
+                ),
+            },
+            Err(e) => tracing::warn!(
+                key = %obj.key,
+                error = %e,
+                "failed to fetch conflict file, ignoring"
+            ),
+        }
+    }
+    Ok(overlap)
+}
+
+/// Delete one dead narinfo + its NAR. Returns updated stats.
+///
+/// The "NAR before narinfo" order preserves the invariant *"if a narinfo
+/// exists, its NAR exists"* — important because `nix copy` HEADs the
+/// narinfo to decide whether to skip uploading. A half-deleted pair would
+/// otherwise serve a dangling reference until the next sweep.
+async fn delete_one_dead(s3: &S3Client, hash: &str, dry_run: bool, stats: &mut PruneStats) {
+    let narinfo_key = format!("{hash}.narinfo");
+
+    if dry_run {
+        tracing::info!(
+            key = narinfo_key.as_str(),
+            "[DRY RUN] would delete narinfo + NAR"
+        );
+        stats.narinfos_deleted += 1;
+        stats.nars_deleted += 1;
+        return;
+    }
+
+    // --- Resolve the NAR key from the narinfo body. ---
+    let nar_key_opt: Option<String> = match s3.get_object(&narinfo_key).await {
+        Ok(data) => match std::str::from_utf8(&data) {
+            Ok(body_str) => match narinfo::parse_narinfo(body_str) {
+                Ok(info) => match s3_keys::sanitize_nar_url(&info.url) {
+                    Ok(url) => Some(url),
                     Err(e) => {
-                        tracing::warn!(key = key.as_str(), error = %e, "failed to parse dead narinfo, no NAR to delete");
+                        tracing::warn!(key = %narinfo_key, url = %info.url, error = %e, "dead narinfo has invalid URL, no NAR to delete");
                         None
                     }
                 },
                 Err(e) => {
-                    tracing::warn!(key = key.as_str(), error = %e, "dead narinfo body is not valid UTF-8, no NAR to delete");
+                    tracing::warn!(key = %narinfo_key, error = %e, "failed to parse dead narinfo, no NAR to delete");
                     None
                 }
             },
             Err(e) => {
-                tracing::warn!(key = key.as_str(), error = %e, "failed to fetch dead narinfo, no NAR to delete");
+                tracing::warn!(key = %narinfo_key, error = %e, "dead narinfo body is not valid UTF-8, no NAR to delete");
                 None
             }
-        };
-
-        // --- Delete the NAR first, then the narinfo. ---
-        // Order matters: if narinfo points at a NAR, deleting the narinfo
-        // first would leave the NAR readable by anything that's already
-        // resolved a narinfo cached locally — minor — *and* would let
-        // `nix copy` decide to skip a new upload by HEAD on the narinfo
-        // (returning 404, OK) only to find the NAR also gone next time.
-        // Reverse order keeps the NAR alive only as long as a narinfo
-        // points at it.
-        let nar_deleted = if let Some(nar_key) = &nar_key_opt {
-            tracing::info!(key = %nar_key, "deleting dead NAR");
-            match s3.delete_object(nar_key).await {
-                Ok(_) => {
-                    stats.nars_deleted += 1;
-                    true
-                }
-                Err(e) => {
-                    tracing::error!(key = %nar_key, error = %e, "failed to delete NAR file; leaving narinfo in place for next sweep");
-                    false
-                }
-            }
-        } else {
-            // No NAR key resolved — narinfo body was missing, malformed, or
-            // had a bad URL. Nothing to delete on the NAR side; proceed to
-            // delete the narinfo on its own.
-            true
-        };
-
-        if !nar_deleted {
-            // NAR delete failed; skip narinfo this cycle so we don't strand
-            // a NAR with no narinfo (the listing would still find the NAR
-            // next time, but we wouldn't know its hash to clean up).
-            continue;
+        },
+        Err(e) => {
+            tracing::warn!(key = %narinfo_key, error = %e, "failed to fetch dead narinfo, no NAR to delete");
+            None
         }
+    };
 
-        tracing::info!(key = key.as_str(), "deleting dead narinfo");
-        match s3.delete_object(key).await {
+    let nar_deleted = if let Some(nar_key) = &nar_key_opt {
+        tracing::info!(key = %nar_key, "deleting dead NAR");
+        match s3.delete_object(nar_key).await {
             Ok(_) => {
-                stats.narinfos_deleted += 1;
+                stats.nars_deleted += 1;
+                true
             }
             Err(e) => {
-                tracing::error!(key = key.as_str(), error = %e, "failed to delete narinfo key (NAR already deleted)");
+                tracing::error!(key = %nar_key, error = %e, "failed to delete NAR file; leaving narinfo in place for next sweep");
+                false
+            }
+        }
+    } else {
+        // No NAR key resolved — narinfo body was missing, malformed, or
+        // had a bad URL. Nothing to delete on the NAR side; proceed to
+        // delete the narinfo on its own.
+        true
+    };
+
+    if !nar_deleted {
+        // NAR delete failed; skip narinfo this cycle so we don't strand
+        // a NAR with no narinfo (the listing would still find the NAR
+        // next time, but we wouldn't know its hash to clean up).
+        return;
+    }
+
+    tracing::info!(key = %narinfo_key, "deleting dead narinfo");
+    match s3.delete_object(&narinfo_key).await {
+        Ok(_) => {
+            stats.narinfos_deleted += 1;
+        }
+        Err(e) => {
+            tracing::error!(key = %narinfo_key, error = %e, "failed to delete narinfo key (NAR already deleted)");
+        }
+    }
+}
+
+/// Delete every hash in `delete_set` (NAR-first, then narinfo). No
+/// conflict polling — used both as the inner step of `run_attempt` and
+/// directly by tests / single-shot sweeps where coordination is unneeded.
+async fn delete_dead_objects(
+    s3: &S3Client,
+    delete_set: &[String],
+    dry_run: bool,
+) -> Result<PruneStats> {
+    let mut stats = PruneStats::default();
+    for (i, hash) in delete_set.iter().enumerate() {
+        delete_one_dead(s3, hash, dry_run, &mut stats).await;
+        if (i + 1).is_multiple_of(100) {
+            tracing::info!(
+                processed = i + 1,
+                deleted = stats.narinfos_deleted,
+                "sweep: progress"
+            );
+        }
+    }
+    Ok(stats)
+}
+
+/// Run a single prune attempt: poll for conflicts before each batch, then
+/// delete a batch's worth of dead narinfo + NAR pairs. If conflicts arrive
+/// that overlap our remaining work, subtract them and yield (the caller
+/// finalizes this attempt and spawns a fresh one with the reduced set).
+///
+/// `attempt_id` is used only to derive the conflicts/ prefix; the marker
+/// PUT is the caller's responsibility (so the caller controls
+/// publish-before-delete ordering).
+async fn run_attempt(
+    s3: &S3Client,
+    attempt_id: &str,
+    delete_set: Vec<String>,
+    batch_size: usize,
+    dry_run: bool,
+) -> Result<AttemptOutcome> {
+    let conflicts_prefix = s3_keys::prune_attempt_conflicts_prefix(attempt_id);
+    let mut remaining: HashSet<String> = delete_set.into_iter().collect();
+    let mut stats = PruneStats::default();
+
+    loop {
+        if remaining.is_empty() {
+            return Ok(AttemptOutcome::Drained { stats });
+        }
+
+        // Poll conflicts *before* each batch. A pusher whose conflict
+        // landed since the last poll must be honoured before we delete any
+        // of their hashes — that's the whole point of the protocol.
+        let overlap = fetch_conflict_overlap(s3, &conflicts_prefix, &remaining).await?;
+        if !overlap.is_empty() {
+            tracing::info!(
+                attempt_id = %attempt_id,
+                conflicts = overlap.len(),
+                "conflict detected; yielding current attempt"
+            );
+            for h in &overlap {
+                remaining.remove(h);
+            }
+            return Ok(AttemptOutcome::Yielded {
+                remaining: remaining.into_iter().collect(),
+                stats,
+            });
+        }
+
+        // Pick a batch. Order is whatever HashSet iteration gives us; the
+        // spec doesn't require any particular delete order, only that each
+        // deletion preserves the NAR-before-narinfo invariant (handled
+        // inside `delete_one_dead`).
+        let batch: Vec<String> = remaining.iter().take(batch_size).cloned().collect();
+        let batch_stats = delete_dead_objects(s3, &batch, dry_run).await?;
+        stats.merge(batch_stats);
+        for hash in &batch {
+            remaining.remove(hash);
+        }
+    }
+}
+
+/// Top-level sweep orchestration: compute the candidate set, then run a
+/// sequence of prune attempts (publishing each marker before any deletes,
+/// finalizing each marker after deletes/yield, and looping until either
+/// drained or all conflicts are satisfied).
+pub async fn run_pruning(
+    s3: &S3Client,
+    live_hashes: &HashSet<String>,
+    prune_start_at: DateTime<Utc>,
+    batch_size: usize,
+    dry_run: bool,
+) -> Result<PruneStats> {
+    let candidates = compute_delete_set(s3, live_hashes, prune_start_at).await?;
+    let mut remaining = candidates.delete_set;
+    // Seed `narinfos_checked` with the scan count so the published metric
+    // matches the pre-coordination behaviour: it's a measure of how much
+    // of the bucket we walked, not how much we deleted.
+    let mut total_stats = PruneStats {
+        narinfos_checked: candidates.scanned,
+        ..PruneStats::default()
+    };
+
+    while !remaining.is_empty() {
+        let attempt_id = coordination::new_id();
+        let mut attempt = PruneAttempt::new_running(attempt_id.clone(), remaining.clone());
+
+        // Publish the marker BEFORE any deletes. A pusher who lists
+        // attempts after this PUT can find us and claim conflicts; one
+        // who lists before sees no attempt and is safe to skip the
+        // wait. There must never be a state where we've deleted
+        // anything but no marker exists.
+        publish_attempt(s3, &attempt).await?;
+        tracing::info!(
+            attempt_id = %attempt_id,
+            delete_set = remaining.len(),
+            "published prune attempt marker"
+        );
+
+        let outcome = run_attempt(s3, &attempt_id, remaining, batch_size, dry_run).await?;
+
+        // Finalize the attempt regardless of outcome — the marker becomes
+        // immutable from this point. Pushers polling for status=Done are
+        // unblocked here.
+        attempt.finalize();
+        publish_attempt(s3, &attempt).await?;
+        tracing::info!(
+            attempt_id = %attempt_id,
+            "finalized prune attempt marker"
+        );
+
+        match outcome {
+            AttemptOutcome::Drained { stats } => {
+                total_stats.merge(stats);
+                remaining = Vec::new();
+            }
+            AttemptOutcome::Yielded {
+                remaining: r,
+                stats,
+            } => {
+                total_stats.merge(stats);
+                remaining = r;
             }
         }
     }
 
     tracing::info!(
-        narinfos_checked = stats.narinfos_checked,
-        narinfos_deleted = stats.narinfos_deleted,
-        nars_deleted = stats.nars_deleted,
+        narinfos_checked = total_stats.narinfos_checked,
+        narinfos_deleted = total_stats.narinfos_deleted,
+        nars_deleted = total_stats.nars_deleted,
         dry_run = dry_run,
-        "sweep phase complete",
+        "sweep complete (all attempts done)",
     );
 
+    Ok(total_stats)
+}
+
+/// PUT a prune attempt marker JSON to S3.
+async fn publish_attempt(s3: &S3Client, attempt: &PruneAttempt) -> Result<()> {
+    let key = s3_keys::prune_attempt_key(&attempt.attempt_id);
+    let body = serde_json::to_vec_pretty(attempt)
+        .with_context(|| format!("failed to serialize prune attempt {}", attempt.attempt_id))?;
+    s3.upload_object(&key, body, Some("application/json"))
+        .await
+        .with_context(|| format!("failed to upload prune attempt marker {key}"))
+}
+
+/// Read the marker for a single prune attempt. Returns `Ok(None)` if the
+/// marker is absent (e.g. janitor-GC'd between list and read) or
+/// unparseable. Other fetch errors are propagated so callers can decide
+/// whether to retry.
+pub async fn fetch_attempt_marker(s3: &S3Client, key: &str) -> Result<Option<PruneAttempt>> {
+    match s3.get_object(key).await {
+        Ok(data) => match serde_json::from_slice::<PruneAttempt>(&data) {
+            Ok(a) => Ok(Some(a)),
+            Err(e) => {
+                tracing::warn!(key = %key, error = %e, "failed to parse prune attempt marker, ignoring");
+                Ok(None)
+            }
+        },
+        Err(e) => {
+            if is_not_found(&e) {
+                Ok(None)
+            } else {
+                Err(e.context(format!("failed to fetch prune attempt marker {key}")))
+            }
+        }
+    }
+}
+
+/// List every running prune attempt's marker. Done attempts are skipped
+/// (a pusher only needs to consult attempts that haven't yet committed).
+pub async fn list_running_attempts(s3: &S3Client) -> Result<Vec<PruneAttempt>> {
+    let mut listing = s3.list_objects(s3_keys::PRUNE_ATTEMPTS_PREFIX).boxed();
+    let mut keys: Vec<String> = Vec::new();
+    while let Some(obj) = listing.try_next().await? {
+        if s3_keys::is_prune_attempt_marker_key(&obj.key) {
+            keys.push(obj.key);
+        }
+    }
+
+    let mut attempts: Vec<PruneAttempt> = Vec::new();
+    for key in keys {
+        if let Some(a) = fetch_attempt_marker(s3, &key).await?
+            && a.status == AttemptStatus::Running
+        {
+            attempts.push(a);
+        }
+    }
+    Ok(attempts)
+}
+
+/// Best-effort GC of finalized prune attempt markers (and orphaned
+/// conflict files). Markers younger than `age_secs` are kept so that any
+/// in-flight push can still detect attempts whose lifetime overlapped its
+/// upload window via post-check.
+///
+/// Conflict files are deleted when:
+///   - their parent attempt is being deleted in this run, OR
+///   - their parent attempt's marker is missing entirely (orphaned).
+///
+/// Conflict files for currently-running attempts are left alone — the
+/// running prune still needs to read them to honour conflicts.
+pub async fn janitor_phase(s3: &S3Client, age_secs: i64, dry_run: bool) -> Result<()> {
+    let cutoff = Utc::now() - Duration::seconds(age_secs);
+    let mut listing = s3.list_objects(s3_keys::PRUNE_ATTEMPTS_PREFIX).boxed();
+
+    let mut all_keys: Vec<String> = Vec::new();
+    while let Some(obj) = listing.try_next().await? {
+        all_keys.push(obj.key);
+    }
+
+    // Partition into top-level markers vs. conflict files.
+    let mut marker_keys: Vec<String> = Vec::new();
+    let mut conflict_keys: Vec<String> = Vec::new();
+    for key in all_keys {
+        if s3_keys::is_prune_attempt_marker_key(&key) {
+            marker_keys.push(key);
+        } else if s3_keys::parse_conflict_key_attempt_id(&key).is_some() {
+            conflict_keys.push(key);
+        }
+        // Anything else under meta/prune-attempts/ is unexpected — leave
+        // it alone rather than risk deleting state we don't recognise.
+    }
+
+    // Fetch markers, classify by age + status.
+    let mut keep_attempt_ids: HashSet<String> = HashSet::new();
+    let mut markers_to_delete: Vec<String> = Vec::new();
+    let mut deletable_attempt_ids: HashSet<String> = HashSet::new();
+    for key in &marker_keys {
+        match fetch_attempt_marker(s3, key).await? {
+            Some(a) => {
+                let is_old_done =
+                    a.status == AttemptStatus::Done && a.ended_at.is_some_and(|t| t < cutoff);
+                if is_old_done {
+                    deletable_attempt_ids.insert(a.attempt_id.clone());
+                    markers_to_delete.push(key.clone());
+                } else {
+                    keep_attempt_ids.insert(a.attempt_id.clone());
+                }
+            }
+            None => {
+                // Unparseable marker — leave it (operator should
+                // investigate). Don't fold it into the deletable set
+                // because that would also delete its conflict files.
+                tracing::warn!(key = %key, "janitor: unparseable marker, skipping");
+            }
+        }
+    }
+
+    // Conflict files: delete iff parent attempt is being deleted in
+    // this pass, OR parent attempt is absent (orphaned).
+    let mut conflicts_to_delete: Vec<String> = Vec::new();
+    for ck in &conflict_keys {
+        let Some(attempt_id) = s3_keys::parse_conflict_key_attempt_id(ck) else {
+            continue;
+        };
+        if deletable_attempt_ids.contains(attempt_id) {
+            conflicts_to_delete.push(ck.clone());
+        } else if !keep_attempt_ids.contains(attempt_id) {
+            // Parent marker not in our list — either being deleted in
+            // this pass (impossible: we already checked) or genuinely
+            // missing. Treat as orphaned.
+            conflicts_to_delete.push(ck.clone());
+        }
+    }
+
+    let total = markers_to_delete.len() + conflicts_to_delete.len();
+    if dry_run {
+        tracing::info!(
+            attempts = markers_to_delete.len(),
+            conflicts = conflicts_to_delete.len(),
+            cutoff = %cutoff,
+            "[DRY RUN] janitor: would delete {total} keys"
+        );
+        return Ok(());
+    }
+
+    // Conflicts first, then markers — keeps the "if marker exists, its
+    // conflict files are still discoverable" invariant intact through
+    // the partial-failure window (a crash mid-deletion leaves a
+    // marker with stripped conflicts, which is fine; the inverse is
+    // also fine but less tidy).
+    for k in &conflicts_to_delete {
+        if let Err(e) = s3.delete_object(k).await {
+            tracing::warn!(key = %k, error = %e, "janitor: failed to delete conflict file, skipping");
+        }
+    }
+    for k in &markers_to_delete {
+        if let Err(e) = s3.delete_object(k).await {
+            tracing::warn!(key = %k, error = %e, "janitor: failed to delete attempt marker, skipping");
+        }
+    }
+
+    tracing::info!(
+        attempts_gcd = markers_to_delete.len(),
+        conflicts_gcd = conflicts_to_delete.len(),
+        cutoff = %cutoff,
+        "janitor: cleaned old prune-attempt markers"
+    );
+    Ok(())
+}
+
+/// Test-only convenience: compute the delete set and delete it
+/// straight-through, without publishing a prune-attempt marker or polling
+/// for conflicts. Lets the existing freshness/guardrail/deletion-semantics
+/// tests target the underlying logic without having to mock the
+/// coordination layer.
+#[cfg(test)]
+pub(crate) async fn sweep_phase(
+    s3: &S3Client,
+    live_hashes: &HashSet<String>,
+    prune_start_at: DateTime<Utc>,
+    dry_run: bool,
+) -> Result<PruneStats> {
+    let candidates = compute_delete_set(s3, live_hashes, prune_start_at).await?;
+    let mut stats = delete_dead_objects(s3, &candidates.delete_set, dry_run).await?;
+    stats.narinfos_checked = candidates.scanned;
     Ok(stats)
 }
 
@@ -1042,6 +1464,7 @@ mod tests {
                     .body(SdkBody::from(list_xml(&[
                         "deaddeaddeaddeaddeaddeaddeaddead.narinfo",
                         "generations/x.narinfo",
+                        "meta/prune-attempts/some-attempt.json.narinfo",
                     ])))
                     .unwrap(),
             ),
@@ -1075,8 +1498,9 @@ mod tests {
         let stats = sweep_phase(&client, &live, default_prune_start_at(), false)
             .await
             .unwrap();
-        // Both narinfos are counted as checked, but generations/ one is skipped
-        assert_eq!(stats.narinfos_checked, 2);
+        // All three narinfos are counted as checked, but generations/ and
+        // meta/ are skipped — only the bare dead narinfo is deleted.
+        assert_eq!(stats.narinfos_checked, 3);
         assert_eq!(stats.narinfos_deleted, 1);
     }
 
@@ -1469,5 +1893,432 @@ mod tests {
         assert_eq!(stats.narinfos_checked, 0);
         assert_eq!(stats.narinfos_deleted, 0);
         assert_eq!(stats.nars_deleted, 0);
+    }
+
+    // ── attempt-loop / conflict-protocol tests ─────────────────────
+
+    fn empty_list_xml() -> String {
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult>
+</ListBucketResult>"#
+            .to_string()
+    }
+
+    /// Helper: stage one full attempt's S3 events for a given delete set.
+    /// Caller appends to the StaticReplayClient queue. Order:
+    ///   1. PUT initial marker
+    ///   2. LIST conflicts (empty)
+    ///   3. per hash: GET narinfo + DELETE NAR + DELETE narinfo
+    ///   4. PUT finalize marker
+    fn happy_attempt_events(hashes: &[&str]) -> Vec<ReplayEvent> {
+        let mut events = vec![
+            // PUT initial marker
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::empty())
+                    .unwrap(),
+            ),
+            // LIST conflicts (empty)
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(empty_list_xml()))
+                    .unwrap(),
+            ),
+        ];
+        for h in hashes {
+            events.push(ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(narinfo_body(h, &[])))
+                    .unwrap(),
+            ));
+            events.push(ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::empty())
+                    .unwrap(),
+            ));
+            events.push(ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::empty())
+                    .unwrap(),
+            ));
+        }
+        // PUT finalize marker
+        events.push(ReplayEvent::new(
+            empty_request(),
+            http::Response::builder()
+                .status(200)
+                .body(SdkBody::empty())
+                .unwrap(),
+        ));
+        events
+    }
+
+    #[tokio::test]
+    async fn run_pruning_publishes_marker_and_finalises_on_drain() {
+        // No conflicts; one dead hash. Events:
+        //   1. compute_delete_set: LIST bucket
+        //   2. PUT initial marker
+        //   3. LIST conflicts (empty)
+        //   4. GET narinfo + DELETE NAR + DELETE narinfo
+        //   5. PUT finalize marker
+        let live: HashSet<String> = HashSet::new();
+        let mut events = vec![ReplayEvent::new(
+            empty_request(),
+            http::Response::builder()
+                .status(200)
+                .body(SdkBody::from(list_xml(&[
+                    "deaddeaddeaddeaddeaddeaddeaddead.narinfo",
+                ])))
+                .unwrap(),
+        )];
+        events.extend(happy_attempt_events(&["deaddeaddeaddeaddeaddeaddeaddead"]));
+        let client = mock_client(events);
+
+        let stats = run_pruning(&client, &live, default_prune_start_at(), 50, false)
+            .await
+            .unwrap();
+        assert_eq!(stats.narinfos_checked, 1);
+        assert_eq!(stats.narinfos_deleted, 1);
+        assert_eq!(stats.nars_deleted, 1);
+    }
+
+    #[tokio::test]
+    async fn run_pruning_skips_attempt_loop_when_nothing_to_delete() {
+        // All narinfos live → empty delete set → no marker PUT, no
+        // conflict LIST. The StaticReplayClient panics on extra events,
+        // so a single LIST event proves we skipped the attempt loop.
+        let mut live: HashSet<String> = HashSet::new();
+        live.insert("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string());
+        let client = mock_client(vec![ReplayEvent::new(
+            empty_request(),
+            http::Response::builder()
+                .status(200)
+                .body(SdkBody::from(list_xml(&[
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narinfo",
+                ])))
+                .unwrap(),
+        )]);
+
+        let stats = run_pruning(&client, &live, default_prune_start_at(), 50, false)
+            .await
+            .unwrap();
+        assert_eq!(stats.narinfos_checked, 1);
+        assert_eq!(stats.narinfos_deleted, 0);
+        assert_eq!(stats.nars_deleted, 0);
+    }
+
+    #[tokio::test]
+    async fn run_attempt_yields_and_subtracts_when_conflict_overlaps() {
+        // Pre-stage: a conflict file claims one of two delete-set hashes.
+        // run_attempt should:
+        //   1. LIST conflicts → see the conflict file.
+        //   2. GET conflict body → parse claim.
+        //   3. Yield with `remaining` containing only the unconflicted hash.
+        // No deletes happen because we yield before the first batch.
+        let conflicting = "deaddeaddeaddeaddeaddeaddeaddead";
+        let untouched = "ffffffffffffffffffffffffffffffff";
+
+        let conflict_json = serde_json::json!({
+            "version": 1,
+            "push_id": "p1",
+            "uploaded_at": "2026-05-09T12:00:00Z",
+            "claim": [conflicting],
+        })
+        .to_string();
+
+        let attempt_id = "test-attempt";
+        let conflict_key = format!("meta/prune-attempts/{attempt_id}/conflicts/p1.json");
+
+        let client = mock_client(vec![
+            // LIST conflicts: one file present.
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(list_xml(&[&conflict_key])))
+                    .unwrap(),
+            ),
+            // GET conflict body.
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(conflict_json))
+                    .unwrap(),
+            ),
+        ]);
+
+        let outcome = run_attempt(
+            &client,
+            attempt_id,
+            vec![conflicting.to_string(), untouched.to_string()],
+            50,
+            false,
+        )
+        .await
+        .unwrap();
+
+        match outcome {
+            AttemptOutcome::Yielded { remaining, stats } => {
+                assert_eq!(remaining.len(), 1);
+                assert_eq!(remaining[0], untouched);
+                // Nothing was deleted in this attempt — we yielded first.
+                assert_eq!(stats.narinfos_deleted, 0);
+                assert_eq!(stats.nars_deleted, 0);
+            }
+            other => panic!("expected Yielded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_attempt_drains_when_no_conflicts() {
+        // Single hash, no conflicts. Should drain after one batch and
+        // re-poll to confirm remaining is empty.
+        let hash = "deaddeaddeaddeaddeaddeaddeaddead";
+
+        let client = mock_client(vec![
+            // LIST conflicts (empty)
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(empty_list_xml()))
+                    .unwrap(),
+            ),
+            // GET narinfo
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(narinfo_body(hash, &[])))
+                    .unwrap(),
+            ),
+            // DELETE NAR
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::empty())
+                    .unwrap(),
+            ),
+            // DELETE narinfo
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::empty())
+                    .unwrap(),
+            ),
+        ]);
+
+        let outcome = run_attempt(&client, "id", vec![hash.to_string()], 50, false)
+            .await
+            .unwrap();
+        match outcome {
+            AttemptOutcome::Drained { stats } => {
+                assert_eq!(stats.narinfos_deleted, 1);
+                assert_eq!(stats.nars_deleted, 1);
+            }
+            other => panic!("expected Drained, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn janitor_deletes_old_done_marker_and_its_conflicts() {
+        // Old finalised attempt: ended_at older than cutoff. Should be
+        // deleted along with its conflict file.
+        let attempt_key = "meta/prune-attempts/old-attempt.json";
+        let conflict_key = "meta/prune-attempts/old-attempt/conflicts/p.json";
+        let old_done_marker = r#"{"version":1,"attempt_id":"old-attempt","started_at":"2020-01-01T00:00:00Z","ended_at":"2020-01-01T00:00:01Z","status":"done","delete_set":[]}"#;
+
+        let client = mock_client(vec![
+            // LIST attempts prefix
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(list_xml(&[attempt_key, conflict_key])))
+                    .unwrap(),
+            ),
+            // GET marker — done, very old
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(old_done_marker))
+                    .unwrap(),
+            ),
+            // DELETE conflict
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::empty())
+                    .unwrap(),
+            ),
+            // DELETE marker
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::empty())
+                    .unwrap(),
+            ),
+        ]);
+
+        // age=60s; the marker's ended_at is 2020 so it's well past cutoff.
+        janitor_phase(&client, 60, false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn janitor_keeps_running_marker_and_its_conflicts() {
+        // Marker is still running; janitor must not touch it or its conflicts.
+        let attempt_key = "meta/prune-attempts/live.json";
+        let conflict_key = "meta/prune-attempts/live/conflicts/p.json";
+        let running_marker = r#"{"version":1,"attempt_id":"live","started_at":"2020-01-01T00:00:00Z","ended_at":null,"status":"running","delete_set":[]}"#;
+
+        let client = mock_client(vec![
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(list_xml(&[attempt_key, conflict_key])))
+                    .unwrap(),
+            ),
+            // GET marker — still running, even though it's old
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(running_marker))
+                    .unwrap(),
+            ),
+            // No DELETE events: StaticReplayClient panics on extras.
+        ]);
+
+        janitor_phase(&client, 60, false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn janitor_deletes_orphaned_conflict() {
+        // Conflict file whose parent attempt marker is missing entirely.
+        // (Could happen if a prior janitor run deleted the marker but
+        // crashed before the conflict, or via manual S3 cleanup.)
+        let orphan_conflict = "meta/prune-attempts/ghost/conflicts/p.json";
+
+        let client = mock_client(vec![
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(list_xml(&[orphan_conflict])))
+                    .unwrap(),
+            ),
+            // DELETE orphan conflict
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::empty())
+                    .unwrap(),
+            ),
+        ]);
+
+        janitor_phase(&client, 60, false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_pruning_loops_attempts_after_yield() {
+        // Two dead hashes. First attempt's conflict list contains one of
+        // them. run_pruning should:
+        //   1. compute delete set (LIST bucket).
+        //   2. Publish attempt-1 marker (PUT).
+        //   3. LIST conflicts — one conflict file.
+        //   4. GET conflict body → conflicting hash matches one entry.
+        //   5. Finalize attempt-1 (PUT).
+        //   6. Publish attempt-2 marker (PUT) with reduced delete_set.
+        //   7. LIST conflicts (empty).
+        //   8. Delete the remaining hash (GET narinfo + 2 DELETEs).
+        //   9. Finalize attempt-2 (PUT).
+        let conflicting = "deaddeaddeaddeaddeaddeaddeaddead";
+        let untouched = "ffffffffffffffffffffffffffffffff";
+
+        let live: HashSet<String> = HashSet::new();
+        let conflict_json = serde_json::json!({
+            "version": 1,
+            "push_id": "p1",
+            "uploaded_at": "2026-05-09T12:00:00Z",
+            "claim": [conflicting],
+        })
+        .to_string();
+
+        let mut events = vec![
+            // 1. Compute delete set
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(list_xml(&[
+                        &format!("{conflicting}.narinfo"),
+                        &format!("{untouched}.narinfo"),
+                    ])))
+                    .unwrap(),
+            ),
+            // 2. Publish attempt-1 marker
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::empty())
+                    .unwrap(),
+            ),
+            // 3. LIST conflicts (one file)
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(list_xml(&[
+                        "meta/prune-attempts/some/conflicts/p1.json",
+                    ])))
+                    .unwrap(),
+            ),
+            // 4. GET conflict body
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(conflict_json))
+                    .unwrap(),
+            ),
+            // 5. Finalize attempt-1 marker
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::empty())
+                    .unwrap(),
+            ),
+        ];
+        // Attempt 2 (only `untouched` remains; happy_attempt_events covers it).
+        events.extend(happy_attempt_events(&[untouched]));
+        let client = mock_client(events);
+
+        let stats = run_pruning(&client, &live, default_prune_start_at(), 50, false)
+            .await
+            .unwrap();
+        assert_eq!(stats.narinfos_checked, 2);
+        // Only the non-conflicted hash got deleted.
+        assert_eq!(stats.narinfos_deleted, 1);
+        assert_eq!(stats.nars_deleted, 1);
     }
 }
