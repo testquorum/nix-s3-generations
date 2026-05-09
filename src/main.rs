@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+mod coordination;
 mod forget;
 mod generation;
 mod narinfo;

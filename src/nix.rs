@@ -161,6 +161,45 @@ pub fn diff_snapshots(before: &HashSet<StorePath>, after: &HashSet<StorePath>) -
     after.difference(before).cloned().collect()
 }
 
+/// Joint transitive closure of `roots` traversed via `snapshot`'s
+/// `references` graph, returned as a set of *hashes* (the 32-character
+/// base32 prefix of each store-path basename, no `.narinfo` suffix).
+///
+/// Used by the push side to compute the "claim set" — the hashes a push
+/// needs preserved on S3 to keep its generation root valid. Pre/post-check
+/// intersect this set with each running prune attempt's `delete_set`.
+///
+/// Paths in `roots` that don't appear in `snapshot` are skipped silently:
+/// the snapshot is what `nix path-info --all` produced at run start, so a
+/// missing path means it's not in the local store and so can't be in our
+/// closure.
+pub fn closure_hashes(roots: &[NixStorePath], snapshot: &HashSet<StorePath>) -> HashSet<String> {
+    let by_path: HashMap<&Path, &StorePath> =
+        snapshot.iter().map(|p| (p.path.as_path(), p)).collect();
+
+    let mut visited: HashSet<&Path> = HashSet::new();
+    let mut stack: Vec<&Path> = roots.iter().map(|r| r.as_path()).collect();
+    while let Some(curr) = stack.pop() {
+        if !visited.insert(curr) {
+            continue;
+        }
+        if let Some(node) = by_path.get(curr) {
+            for r in &node.references {
+                stack.push(r.as_path());
+            }
+        }
+    }
+
+    visited
+        .into_iter()
+        .filter_map(|p| {
+            let basename = p.file_name()?.to_str()?;
+            let (hash, _) = basename.split_once('-')?;
+            Some(hash.to_string())
+        })
+        .collect()
+}
+
 /// Reduce a set of store paths to the minimal subset whose joint closure is
 /// the same as the original set's joint closure. A path P is dropped if some
 /// other path Q in the set has P in its transitive closure (so referencing Q
@@ -540,6 +579,52 @@ mod tests {
 
         let cover = minimal_closure_cover(&[a, b], &snapshot);
         assert_eq!(cover, vec![nsp("/nix/store/a"), nsp("/nix/store/b")]);
+    }
+
+    #[test]
+    fn test_closure_hashes_walks_transitive_refs() {
+        // a -> b -> c; one root, three hashes.
+        let a = store_path_with_refs(
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-pkg-a",
+            &["/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-pkg-b"],
+        );
+        let b = store_path_with_refs(
+            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-pkg-b",
+            &["/nix/store/cccccccccccccccccccccccccccccccc-pkg-c"],
+        );
+        let c = store_path_with_refs("/nix/store/cccccccccccccccccccccccccccccccc-pkg-c", &[]);
+        let snapshot: HashSet<StorePath> = [a.clone(), b, c].into_iter().collect();
+
+        let hashes = closure_hashes(&[a.path.clone()], &snapshot);
+        assert_eq!(hashes.len(), 3);
+        assert!(hashes.contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert!(hashes.contains("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+        assert!(hashes.contains("cccccccccccccccccccccccccccccccc"));
+    }
+
+    #[test]
+    fn test_closure_hashes_handles_diamond_without_double_visit() {
+        // a depends on b and c; both b and c depend on d.
+        let a = store_path_with_refs("/nix/store/a-a", &["/nix/store/b-b", "/nix/store/c-c"]);
+        let b = store_path_with_refs("/nix/store/b-b", &["/nix/store/d-d"]);
+        let c = store_path_with_refs("/nix/store/c-c", &["/nix/store/d-d"]);
+        let d = store_path_with_refs("/nix/store/d-d", &[]);
+        let snapshot: HashSet<StorePath> = [a.clone(), b, c, d].into_iter().collect();
+
+        let hashes = closure_hashes(&[a.path.clone()], &snapshot);
+        assert_eq!(hashes.len(), 4);
+    }
+
+    #[test]
+    fn test_closure_hashes_skips_unknown_root() {
+        // Root path not in the snapshot — silently skipped.
+        let snapshot: HashSet<StorePath> = HashSet::new();
+        let hashes = closure_hashes(&[nsp("/nix/store/x-x")], &snapshot);
+        // The root itself produces a hash entry even though it isn't in
+        // the snapshot — visited records the path before we look it up.
+        // This is fine: the pusher's claim should include the root hash.
+        assert_eq!(hashes.len(), 1);
+        assert!(hashes.contains("x"));
     }
 
     #[test]

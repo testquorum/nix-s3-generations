@@ -76,6 +76,68 @@ pub fn is_narinfo_key(key: &str) -> bool {
     key.ends_with(".narinfo")
 }
 
+/// Top-level prefix for non-data state: prune coordination markers,
+/// schema version files, audit logs, etc. Anything under `meta/` is
+/// off-limits to the sweep guardrail (see `is_meta_key`).
+pub const META_PREFIX: &str = "meta/";
+
+/// S3 key for a prune attempt marker:
+/// `meta/prune-attempts/{attempt_id}.json`. Mutable while the attempt is
+/// running; rewritten exactly once when the attempt finalizes.
+pub fn prune_attempt_key(attempt_id: &str) -> String {
+    format!("meta/prune-attempts/{attempt_id}.json")
+}
+
+/// Listing prefix for a single attempt's conflict files.
+/// `meta/prune-attempts/{attempt_id}/conflicts/`.
+pub fn prune_attempt_conflicts_prefix(attempt_id: &str) -> String {
+    format!("meta/prune-attempts/{attempt_id}/conflicts/")
+}
+
+/// S3 key for a single push conflict notice within an attempt:
+/// `meta/prune-attempts/{attempt_id}/conflicts/{push_id}.json`.
+pub fn prune_conflict_key(attempt_id: &str, push_id: &str) -> String {
+    format!("meta/prune-attempts/{attempt_id}/conflicts/{push_id}.json")
+}
+
+/// Listing prefix for all prune attempt markers.
+/// `meta/prune-attempts/`. Note: matches both the marker JSON (e.g.
+/// `meta/prune-attempts/{id}.json`) and any per-attempt subdirectory
+/// (e.g. `meta/prune-attempts/{id}/conflicts/...`); callers filter by
+/// `.ends_with(".json")` and the absence of `/conflicts/` to isolate
+/// just the attempt markers.
+pub const PRUNE_ATTEMPTS_PREFIX: &str = "meta/prune-attempts/";
+
+/// Returns true iff the given key looks like a top-level prune attempt
+/// marker (i.e. directly under `meta/prune-attempts/`, ends `.json`, and
+/// does not have an extra `/` indicating it's actually a conflict file
+/// nested below).
+pub fn is_prune_attempt_marker_key(key: &str) -> bool {
+    let Some(rest) = key.strip_prefix(PRUNE_ATTEMPTS_PREFIX) else {
+        return false;
+    };
+    rest.ends_with(".json") && !rest.contains('/')
+}
+
+/// Inverse of [`prune_conflict_key`]: given a conflict file's S3 key,
+/// recover the parent `attempt_id`. Returns `None` if the key isn't shaped
+/// like a conflict file under `meta/prune-attempts/{id}/conflicts/...`.
+pub fn parse_conflict_key_attempt_id(key: &str) -> Option<&str> {
+    let rest = key.strip_prefix(PRUNE_ATTEMPTS_PREFIX)?;
+    let (attempt_id, after) = rest.split_once('/')?;
+    if !after.starts_with("conflicts/") {
+        return None;
+    }
+    Some(attempt_id)
+}
+
+/// Returns true if the S3 key is under the `meta/` coordination prefix.
+/// The sweep guardrail uses this to ensure prune never deletes its own
+/// coordination state.
+pub fn is_meta_key(key: &str) -> bool {
+    key.starts_with(META_PREFIX)
+}
+
 /// Validate and return a NAR URL.
 ///
 /// - Rejects path traversal sequences (`..`)
@@ -309,5 +371,76 @@ mod tests {
     fn sanitize_nar_url_rejects_missing_nar_prefix() {
         assert!(sanitize_nar_url("abc.narinfo").is_err());
         assert!(sanitize_nar_url("file.narinfo").is_err());
+    }
+
+    // ── meta/ coordination key tests ────────────────────────────────
+
+    #[test]
+    fn prune_attempt_key_format() {
+        assert_eq!(
+            prune_attempt_key("20260509T120000.000000000Z-deadbeef"),
+            "meta/prune-attempts/20260509T120000.000000000Z-deadbeef.json"
+        );
+    }
+
+    #[test]
+    fn prune_conflict_key_format() {
+        assert_eq!(
+            prune_conflict_key("attempt1", "push1"),
+            "meta/prune-attempts/attempt1/conflicts/push1.json"
+        );
+    }
+
+    #[test]
+    fn prune_attempt_conflicts_prefix_ends_with_slash() {
+        assert_eq!(
+            prune_attempt_conflicts_prefix("attempt1"),
+            "meta/prune-attempts/attempt1/conflicts/"
+        );
+    }
+
+    #[test]
+    fn is_meta_key_recognises_meta_prefix() {
+        assert!(is_meta_key("meta/prune-attempts/abc.json"));
+        assert!(is_meta_key("meta/foo"));
+        assert!(is_meta_key("meta/"));
+        assert!(!is_meta_key("generations/dom/1/g.json"));
+        assert!(!is_meta_key("abc.narinfo"));
+        assert!(!is_meta_key("nar/abc.nar.xz"));
+    }
+
+    #[test]
+    fn parse_conflict_key_attempt_id_round_trip() {
+        let key = prune_conflict_key("attemptX", "pushY");
+        assert_eq!(parse_conflict_key_attempt_id(&key), Some("attemptX"));
+    }
+
+    #[test]
+    fn parse_conflict_key_attempt_id_rejects_non_conflict_paths() {
+        assert_eq!(
+            parse_conflict_key_attempt_id("meta/prune-attempts/abc.json"),
+            None
+        );
+        assert_eq!(parse_conflict_key_attempt_id("nar/abc.nar.xz"), None);
+        assert_eq!(
+            parse_conflict_key_attempt_id("meta/prune-attempts/abc/other/x.json"),
+            None
+        );
+    }
+
+    #[test]
+    fn is_prune_attempt_marker_key_recognises_top_level_jsons_only() {
+        // Top-level marker JSONs.
+        assert!(is_prune_attempt_marker_key("meta/prune-attempts/abc.json"));
+        // Conflict files are nested under {id}/conflicts/ — not markers.
+        assert!(!is_prune_attempt_marker_key(
+            "meta/prune-attempts/abc/conflicts/p.json"
+        ));
+        // Other prefixes don't match.
+        assert!(!is_prune_attempt_marker_key("generations/dom/1/g.json"));
+        // Wrong extension.
+        assert!(!is_prune_attempt_marker_key("meta/prune-attempts/abc.txt"));
+        // Bare prefix.
+        assert!(!is_prune_attempt_marker_key("meta/prune-attempts/"));
     }
 }
