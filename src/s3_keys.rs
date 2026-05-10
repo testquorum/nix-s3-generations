@@ -76,33 +76,31 @@ pub fn is_narinfo_key(key: &str) -> bool {
     key.ends_with(".narinfo")
 }
 
-/// Validate and return a NAR URL.
+/// Returns true if the S3 key matches the NAR layout `nar/<hash>.nar[.<ext>]`.
 ///
-/// - Rejects path traversal sequences (`..`)
-/// - Rejects absolute URLs (`http://` or `https://`)
-/// - Ensures the path starts with `nar/`
-pub fn sanitize_nar_url(url: &str) -> anyhow::Result<String> {
-    // Reject empty string
-    anyhow::ensure!(!url.is_empty(), "NAR URL cannot be empty");
-
-    // Reject absolute URLs
-    anyhow::ensure!(
-        !url.starts_with("http://") && !url.starts_with("https://"),
-        "NAR URL must not be an absolute HTTP URL: {url}"
-    );
-
-    // Reject path traversal
-    anyhow::ensure!(
-        !url.contains(".."),
-        "NAR URL must not contain path traversal: {url}"
-    );
-
-    // Ensure starts with nar/
-    if !url.starts_with("nar/") {
-        anyhow::bail!("NAR URL must start with 'nar/': {url}");
+/// Used by `prune nar` to positively filter the bucket listing before
+/// considering a key for orphan deletion. Anything outside this shape is
+/// not something prune created and not something prune should touch — even
+/// if it lives under `nar/`. We require a non-empty `<hash>` segment, no
+/// embedded `/` after the prefix, and either a bare `.nar` suffix or
+/// `.nar.<non-empty-ext>`.
+pub fn is_nar_key(key: &str) -> bool {
+    let Some(rest) = key.strip_prefix("nar/") else {
+        return false;
+    };
+    if rest.contains('/') {
+        return false;
     }
-
-    Ok(url.to_string())
+    let Some((hash, suffix)) = rest.split_once('.') else {
+        return false;
+    };
+    if hash.is_empty() {
+        return false;
+    }
+    // suffix is everything after the first '.'. Accept either "nar" alone or
+    // "nar.<ext>" with a non-empty extension. `.len() > 4` rejects "nar." (a
+    // trailing dot with no extension) since "nar." is 4 chars.
+    suffix == "nar" || (suffix.starts_with("nar.") && suffix.len() > 4)
 }
 
 #[cfg(test)]
@@ -273,41 +271,56 @@ mod tests {
         assert!(!is_narinfo_key("nar/x4ay.narinfo/file"));
     }
 
-    // Tests for sanitize_nar_url
+    // Tests for is_nar_key
 
     #[test]
-    fn sanitize_nar_url_valid() {
-        assert_eq!(
-            sanitize_nar_url("nar/abc.nar.xz").unwrap(),
-            "nar/abc.nar.xz"
-        );
-        assert_eq!(
-            sanitize_nar_url("nar/x4ayiscwbhcj89ija7s294jrdjss4009.narinfo").unwrap(),
-            "nar/x4ayiscwbhcj89ija7s294jrdjss4009.narinfo"
-        );
+    fn is_nar_key_accepts_uncompressed() {
+        assert!(is_nar_key(
+            "nar/0wab6kssgzmc47dx8qnc9mq2xbgvdbjwv3500yxsxkf68faaan9y.nar"
+        ));
     }
 
     #[test]
-    fn sanitize_nar_url_rejects_path_traversal() {
-        assert!(sanitize_nar_url("../../etc/passwd").is_err());
-        assert!(sanitize_nar_url("nar/../etc/passwd").is_err());
-        assert!(sanitize_nar_url("nar/foo/../bar").is_err());
+    fn is_nar_key_accepts_xz() {
+        assert!(is_nar_key(
+            "nar/0wab6kssgzmc47dx8qnc9mq2xbgvdbjwv3500yxsxkf68faaan9y.nar.xz"
+        ));
     }
 
     #[test]
-    fn sanitize_nar_url_rejects_absolute_http_url() {
-        assert!(sanitize_nar_url("http://evil.com/nar/abc.narinfo").is_err());
-        assert!(sanitize_nar_url("https://evil.com/nar/abc.narinfo").is_err());
+    fn is_nar_key_accepts_zstd_and_other_compressions() {
+        assert!(is_nar_key("nar/abc.nar.zst"));
+        assert!(is_nar_key("nar/abc.nar.bz2"));
+        assert!(is_nar_key("nar/abc.nar.gz"));
+        assert!(is_nar_key("nar/abc.nar.br"));
     }
 
     #[test]
-    fn sanitize_nar_url_rejects_empty_string() {
-        assert!(sanitize_nar_url("").is_err());
+    fn is_nar_key_rejects_subdirectory() {
+        assert!(!is_nar_key("nar/foo/bar.nar.xz"));
     }
 
     #[test]
-    fn sanitize_nar_url_rejects_missing_nar_prefix() {
-        assert!(sanitize_nar_url("abc.narinfo").is_err());
-        assert!(sanitize_nar_url("file.narinfo").is_err());
+    fn is_nar_key_rejects_wrong_prefix() {
+        assert!(!is_nar_key("narrr/x.nar"));
+        assert!(!is_nar_key("abc.nar.xz"));
+        assert!(!is_nar_key("/nar/abc.nar.xz"));
+    }
+
+    #[test]
+    fn is_nar_key_rejects_wrong_suffix() {
+        assert!(!is_nar_key("nar/abc.txt"));
+        assert!(!is_nar_key("nar/abc.narinfo"));
+        assert!(!is_nar_key("nar/abc.tar.xz"));
+    }
+
+    #[test]
+    fn is_nar_key_rejects_empty_or_partial() {
+        assert!(!is_nar_key(""));
+        assert!(!is_nar_key("nar/"));
+        assert!(!is_nar_key("nar/abc"));
+        assert!(!is_nar_key("nar/.nar"));
+        assert!(!is_nar_key("nar/.nar.xz"));
+        assert!(!is_nar_key("nar/abc.nar."));
     }
 }

@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
-use clap::Args;
+use clap::{Args, Subcommand};
 use futures::stream::{self, StreamExt, TryStreamExt};
 
 use crate::generation::GenerationRoot;
@@ -23,6 +23,12 @@ pub const DEFAULT_FRESHNESS_BUFFER_SECS: u64 = 300;
 
 #[derive(Args, Debug, Clone)]
 pub struct PruneArgs {
+    /// Restrict prune to one half of the work. With no subcommand, both
+    /// halves run in series: first `narinfo` (delete dead narinfos), then
+    /// `nar` (delete NARs no surviving narinfo references).
+    #[command(subcommand)]
+    pub command: Option<PruneSubcommand>,
+
     #[arg(long)]
     pub bucket: String,
 
@@ -45,6 +51,16 @@ pub struct PruneArgs {
     pub freshness_buffer_secs: u64,
 }
 
+#[derive(Subcommand, Debug, Clone)]
+pub enum PruneSubcommand {
+    /// Walk the closure from generation roots and delete narinfos that are
+    /// no longer reachable. Does not touch any NARs.
+    Narinfo,
+    /// Collect every NAR URL referenced by every narinfo currently in the
+    /// bucket and delete NARs not in that set. Does not touch any narinfos.
+    Nar,
+}
+
 pub async fn run(args: PruneArgs) -> Result<()> {
     let s3 = S3Client::new(
         args.bucket.clone(),
@@ -53,9 +69,9 @@ pub async fn run(args: PruneArgs) -> Result<()> {
     )
     .await?;
 
-    // Anchor the cutoff *before* mark_phase runs. Any object whose
+    // Anchor the cutoff *before* either phase runs. Any object whose
     // LastModified is at-or-after this instant is treated as "in flight"
-    // and skipped by sweep, even if its hash isn't in the live set.
+    // and skipped, even if it isn't in the relevant live / referenced set.
     let prune_start_at = Utc::now() - Duration::seconds(args.freshness_buffer_secs as i64);
 
     tracing::info!(
@@ -64,21 +80,28 @@ pub async fn run(args: PruneArgs) -> Result<()> {
         dry_run = args.dry_run,
         freshness_buffer_secs = args.freshness_buffer_secs,
         prune_start_at = %prune_start_at,
+        command = ?args.command,
         "starting prune",
     );
 
-    let live_hashes = mark_phase(&s3).await?;
+    match args.command {
+        None => {
+            // Default: both halves, narinfo first so phase 2's URL scan sees
+            // only the surviving narinfos.
+            let live_hashes = mark_phase(&s3).await?;
+            sweep_narinfos(&s3, &live_hashes, prune_start_at, args.dry_run).await?;
+            sweep_nars(&s3, prune_start_at, args.dry_run).await?;
+        }
+        Some(PruneSubcommand::Narinfo) => {
+            let live_hashes = mark_phase(&s3).await?;
+            sweep_narinfos(&s3, &live_hashes, prune_start_at, args.dry_run).await?;
+        }
+        Some(PruneSubcommand::Nar) => {
+            sweep_nars(&s3, prune_start_at, args.dry_run).await?;
+        }
+    }
 
-    let stats = sweep_phase(&s3, &live_hashes, prune_start_at, args.dry_run).await?;
-
-    tracing::info!(
-        narinfos_checked = stats.narinfos_checked,
-        narinfos_deleted = stats.narinfos_deleted,
-        nars_deleted = stats.nars_deleted,
-        dry_run = args.dry_run,
-        "prune complete"
-    );
-
+    tracing::info!("prune complete");
     Ok(())
 }
 
@@ -300,15 +323,25 @@ async fn fetch_and_parse_narinfo(
     }
 }
 
-/// Statistics produced by a sweep phase run.
+/// Statistics produced by `sweep_narinfos`.
 #[derive(Debug, Default)]
-pub struct PruneStats {
+pub struct NarinfoSweepStats {
     pub narinfos_checked: usize,
     pub narinfos_deleted: usize,
-    pub nars_deleted: usize,
 }
 
-/// Delete unreachable narinfo + NAR pairs.
+/// Statistics produced by `sweep_nars`.
+#[derive(Debug, Default)]
+pub struct NarSweepStats {
+    pub narinfos_scanned: usize,
+    pub referenced_nars: usize,
+    pub nars_checked: usize,
+    pub nars_deleted: usize,
+    pub nars_kept_referenced: usize,
+}
+
+/// Delete narinfos whose hash isn't in `live_hashes`. Does **not** touch
+/// NARs — that's `sweep_nars`.
 ///
 /// 1. List ALL objects in the bucket.
 /// 2. Filter to narinfo keys whose `LastModified` predates
@@ -320,31 +353,22 @@ pub struct PruneStats {
 ///    **not** in `live_hashes`:
 ///    - **Guardrails**: skip keys starting with `generations/` or equal to
 ///      `nix-cache-info`.
-///    - `dry_run`: log and increment counters without deleting.
-///    - otherwise: fetch the narinfo body, parse the `URL` field, validate
-///      with [`s3_keys::sanitize_nar_url`], then delete the **NAR first**
-///      and the narinfo only if the NAR delete succeeded.
-/// 4. If the narinfo body cannot be fetched or parsed there's no NAR key to
-///    delete; the narinfo key is deleted on its own (we know it's dead).
+///    - `dry_run`: log and increment the counter without deleting.
+///    - otherwise: delete the narinfo.
 ///
-/// The "NAR before narinfo" order preserves the invariant
-/// *"if a narinfo exists, its NAR exists"* — important because `nix copy`
-/// HEADs the narinfo to decide whether to skip uploading. A half-deleted
-/// pair would otherwise serve a dangling reference until the next sweep.
-pub async fn sweep_phase(
+/// `sweep_nars` (run after this) re-derives the referenced NAR set from
+/// the narinfos that *survive* this phase, so a deduplicated NAR shared
+/// between live and dead narinfos remains protected via the live
+/// narinfo's URL.
+pub async fn sweep_narinfos(
     s3: &S3Client,
     live_hashes: &HashSet<String>,
     prune_start_at: DateTime<Utc>,
     dry_run: bool,
-) -> Result<PruneStats> {
-    tracing::info!("listing all objects in bucket for sweep phase");
+) -> Result<NarinfoSweepStats> {
+    tracing::info!("listing all objects in bucket for narinfo sweep");
     let objects = s3.list_objects("");
 
-    // Narinfo candidates that *might* be eligible for deletion: must be a
-    // narinfo key, and must predate the prune-start cutoff. Items modified
-    // at-or-after the cutoff (or with no `LastModified` in the listing)
-    // could belong to an in-flight push whose generation root hasn't landed
-    // yet, so we filter them out here rather than risk deleting them.
     let mut narinfo_objects = objects
         .try_filter(|o| futures::future::ready(s3_keys::is_narinfo_key(&o.key)))
         .try_filter(|o| {
@@ -370,7 +394,7 @@ pub async fn sweep_phase(
         })
         .boxed();
 
-    let mut stats = PruneStats::default();
+    let mut stats = NarinfoSweepStats::default();
     let mut sweep_count = 0usize;
 
     while let Some(obj) = narinfo_objects.try_next().await? {
@@ -380,7 +404,7 @@ pub async fn sweep_phase(
 
         if sweep_count.is_multiple_of(100) {
             tracing::info!(
-                "sweep: processed {} narinfos, {} deleted",
+                "narinfo sweep: processed {} narinfos, {} deleted",
                 sweep_count,
                 stats.narinfos_deleted
             );
@@ -392,7 +416,6 @@ pub async fn sweep_phase(
             continue;
         }
 
-        // --- Guardrails ---
         if key.starts_with("generations/") {
             tracing::warn!(
                 key = key.as_str(),
@@ -409,70 +432,8 @@ pub async fn sweep_phase(
         }
 
         if dry_run {
-            tracing::info!(key = key.as_str(), "[DRY RUN] would delete narinfo + NAR");
+            tracing::info!(key = key.as_str(), "[DRY RUN] would delete narinfo");
             stats.narinfos_deleted += 1;
-            stats.nars_deleted += 1;
-            continue;
-        }
-
-        // --- Resolve the NAR key from the narinfo body. ---
-        let nar_key_opt: Option<String> = match s3.get_object(key).await {
-            Ok(data) => match std::str::from_utf8(&data) {
-                Ok(body_str) => match narinfo::parse_narinfo(body_str) {
-                    Ok(info) => match s3_keys::sanitize_nar_url(&info.url) {
-                        Ok(url) => Some(url),
-                        Err(e) => {
-                            tracing::warn!(key = key.as_str(), url = %info.url, error = %e, "dead narinfo has invalid URL, no NAR to delete");
-                            None
-                        }
-                    },
-                    Err(e) => {
-                        tracing::warn!(key = key.as_str(), error = %e, "failed to parse dead narinfo, no NAR to delete");
-                        None
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(key = key.as_str(), error = %e, "dead narinfo body is not valid UTF-8, no NAR to delete");
-                    None
-                }
-            },
-            Err(e) => {
-                tracing::warn!(key = key.as_str(), error = %e, "failed to fetch dead narinfo, no NAR to delete");
-                None
-            }
-        };
-
-        // --- Delete the NAR first, then the narinfo. ---
-        // Order matters: if narinfo points at a NAR, deleting the narinfo
-        // first would leave the NAR readable by anything that's already
-        // resolved a narinfo cached locally — minor — *and* would let
-        // `nix copy` decide to skip a new upload by HEAD on the narinfo
-        // (returning 404, OK) only to find the NAR also gone next time.
-        // Reverse order keeps the NAR alive only as long as a narinfo
-        // points at it.
-        let nar_deleted = if let Some(nar_key) = &nar_key_opt {
-            tracing::info!(key = %nar_key, "deleting dead NAR");
-            match s3.delete_object(nar_key).await {
-                Ok(_) => {
-                    stats.nars_deleted += 1;
-                    true
-                }
-                Err(e) => {
-                    tracing::error!(key = %nar_key, error = %e, "failed to delete NAR file; leaving narinfo in place for next sweep");
-                    false
-                }
-            }
-        } else {
-            // No NAR key resolved — narinfo body was missing, malformed, or
-            // had a bad URL. Nothing to delete on the NAR side; proceed to
-            // delete the narinfo on its own.
-            true
-        };
-
-        if !nar_deleted {
-            // NAR delete failed; skip narinfo this cycle so we don't strand
-            // a NAR with no narinfo (the listing would still find the NAR
-            // next time, but we wouldn't know its hash to clean up).
             continue;
         }
 
@@ -482,7 +443,11 @@ pub async fn sweep_phase(
                 stats.narinfos_deleted += 1;
             }
             Err(e) => {
-                tracing::error!(key = key.as_str(), error = %e, "failed to delete narinfo key (NAR already deleted)");
+                tracing::error!(
+                    key = key.as_str(),
+                    error = %e,
+                    "failed to delete narinfo"
+                );
             }
         }
     }
@@ -490,9 +455,185 @@ pub async fn sweep_phase(
     tracing::info!(
         narinfos_checked = stats.narinfos_checked,
         narinfos_deleted = stats.narinfos_deleted,
-        nars_deleted = stats.nars_deleted,
         dry_run = dry_run,
-        "sweep phase complete",
+        "narinfo sweep complete",
+    );
+
+    Ok(stats)
+}
+
+/// Delete NARs that no narinfo in the bucket references.
+///
+/// Independent of the mark phase: walks every `.narinfo` *currently in
+/// S3* and collects each one's `URL:` into `referenced_nar_keys`. Then
+/// walks `nar/` keys and deletes any that match the `is_nar_key` shape,
+/// pass the freshness filter, and aren't in the referenced set.
+///
+/// Walking the live S3 state (not the mark-phase output) is what makes
+/// content-deduplicated NARs safe: two distinct narinfos pointing at the
+/// same `nar/<file-hash>.nar.<ext>` both contribute the URL, so the NAR
+/// is preserved as long as either narinfo survives.
+///
+/// Any failure that prevents reading a narinfo's contents aborts the
+/// whole phase: non-404 GET, non-UTF-8 body, parse error. Most of
+/// these in practice mean S3 is flaking and we can't reason about the
+/// rest of the bucket; the rare "genuinely corrupt narinfo" case has
+/// the same shape and the same right answer — fail loud, leave the
+/// bucket untouched, and let the operator decide. Manual remediation
+/// for a corrupt narinfo is to delete it by hand (accepting that some
+/// of its NARs may then be reaped as orphan on the next run) and
+/// re-run prune.
+///
+/// The `URL:` field is inserted into the referenced set verbatim, no
+/// validation. A weird URL (absolute, path traversal, missing
+/// `nar/` prefix) can never match any key produced by the `nar/`
+/// listing — those are filtered through `is_nar_key` — so it's
+/// equivalent to either skipping it or inserting it. Inserting is
+/// simpler.
+pub async fn sweep_nars(
+    s3: &S3Client,
+    prune_start_at: DateTime<Utc>,
+    dry_run: bool,
+) -> Result<NarSweepStats> {
+    tracing::info!("scanning narinfos to build referenced NAR set");
+
+    let mut narinfo_objects = s3
+        .list_objects("")
+        .try_filter(|o| futures::future::ready(s3_keys::is_narinfo_key(&o.key)))
+        .boxed();
+
+    let mut referenced_nar_keys: HashSet<String> = HashSet::new();
+    let mut narinfos_scanned = 0usize;
+
+    while let Some(obj) = narinfo_objects.try_next().await? {
+        let key = &obj.key;
+
+        // Defensive: skip stray narinfo-suffixed keys under reserved prefixes.
+        if key.starts_with("generations/") || key == "nix-cache-info" {
+            continue;
+        }
+
+        narinfos_scanned += 1;
+
+        let body = match s3.get_object(key).await {
+            Ok(b) => b,
+            Err(e) => {
+                if is_not_found(&e) {
+                    // Narinfo was deleted between listing and GET — fine, it
+                    // can't be protecting any NAR if it isn't there.
+                    continue;
+                }
+                return Err(e.context(format!("failed to fetch narinfo {key} during NAR sweep")));
+            }
+        };
+
+        let body_str = std::str::from_utf8(&body).with_context(|| {
+            format!(
+                "narinfo {key} body is not valid UTF-8 during NAR sweep; \
+                 aborting rather than risk deleting NARs we can't reason about. \
+                 If this narinfo is genuinely corrupt, delete it manually and \
+                 re-run prune."
+            )
+        })?;
+
+        let info = narinfo::parse_narinfo(body_str).with_context(|| {
+            format!(
+                "narinfo {key} failed to parse during NAR sweep; aborting \
+                 rather than risk deleting NARs we can't reason about. If \
+                 this narinfo is genuinely corrupt, delete it manually and \
+                 re-run prune."
+            )
+        })?;
+
+        referenced_nar_keys.insert(info.url);
+    }
+
+    tracing::info!(
+        narinfos_scanned,
+        referenced_nars = referenced_nar_keys.len(),
+        "narinfo scan complete; sweeping NARs",
+    );
+
+    let mut nar_objects = s3
+        .list_objects("nar/")
+        .try_filter(|o| futures::future::ready(s3_keys::is_nar_key(&o.key)))
+        .try_filter(|o| {
+            futures::future::ready(match o.last_modified {
+                Some(lm) if lm < prune_start_at => true,
+                Some(lm) => {
+                    tracing::info!(
+                        key = o.key.as_str(),
+                        last_modified = %lm,
+                        cutoff = %prune_start_at,
+                        "skipping recently-modified NAR (freshness filter)"
+                    );
+                    false
+                }
+                None => {
+                    tracing::warn!(
+                        key = o.key.as_str(),
+                        "NAR has no LastModified in listing, skipping defensively"
+                    );
+                    false
+                }
+            })
+        })
+        .boxed();
+
+    let mut stats = NarSweepStats {
+        narinfos_scanned,
+        referenced_nars: referenced_nar_keys.len(),
+        ..Default::default()
+    };
+    let mut sweep_count = 0usize;
+
+    while let Some(obj) = nar_objects.try_next().await? {
+        let key = &obj.key;
+        sweep_count += 1;
+        stats.nars_checked += 1;
+
+        if sweep_count.is_multiple_of(100) {
+            tracing::info!(
+                "NAR sweep: processed {} NARs, {} deleted",
+                sweep_count,
+                stats.nars_deleted
+            );
+        }
+
+        if referenced_nar_keys.contains(key.as_str()) {
+            stats.nars_kept_referenced += 1;
+            continue;
+        }
+
+        if dry_run {
+            tracing::info!(key = key.as_str(), "[DRY RUN] would delete orphan NAR");
+            stats.nars_deleted += 1;
+            continue;
+        }
+
+        tracing::info!(key = key.as_str(), "deleting orphan NAR");
+        match s3.delete_object(key).await {
+            Ok(_) => {
+                stats.nars_deleted += 1;
+            }
+            Err(e) => {
+                tracing::error!(
+                    key = key.as_str(),
+                    error = %e,
+                    "failed to delete orphan NAR"
+                );
+            }
+        }
+    }
+
+    tracing::info!(
+        narinfos_scanned = stats.narinfos_scanned,
+        referenced_nars = stats.referenced_nars,
+        nars_checked = stats.nars_checked,
+        nars_deleted = stats.nars_deleted,
+        nars_kept_referenced = stats.nars_kept_referenced,
+        dry_run = dry_run,
+        "NAR sweep complete",
     );
 
     Ok(stats)
@@ -945,10 +1086,10 @@ mod tests {
         );
     }
 
-    // ── sweep_phase tests ──────────────────────────────────────────
+    // ── sweep_narinfos tests ───────────────────────────────────────
 
     #[tokio::test]
-    async fn sweep_deletes_dead_narinfos_and_nars() {
+    async fn sweep_narinfos_deletes_dead_narinfos() {
         let mut live: HashSet<String> = HashSet::new();
         live.insert("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string());
 
@@ -967,26 +1108,8 @@ mod tests {
                     ])))
                     .unwrap(),
             ),
-            // get_object("deaddeaddeaddeaddeaddeaddeaddead.narinfo") — fetch body to get URL
-            ReplayEvent::new(
-                empty_request(),
-                http::Response::builder()
-                    .status(200)
-                    .body(SdkBody::from(narinfo_body(
-                        "deaddeaddeaddeaddeaddeaddeaddead",
-                        &[],
-                    )))
-                    .unwrap(),
-            ),
-            // delete_object("deaddeaddeaddeaddeaddeaddeaddead.narinfo")
-            ReplayEvent::new(
-                empty_request(),
-                http::Response::builder()
-                    .status(200)
-                    .body(SdkBody::empty())
-                    .unwrap(),
-            ),
-            // delete_object("nar/deaddeaddeaddeaddeaddeaddeaddead.nar.xz")
+            // delete_object("deaddeaddeaddeaddeaddeaddeaddead.narinfo") — only,
+            // no NAR delete (sweep_nars handles NARs).
             ReplayEvent::new(
                 empty_request(),
                 http::Response::builder()
@@ -996,16 +1119,15 @@ mod tests {
             ),
         ]);
 
-        let stats = sweep_phase(&client, &live, default_prune_start_at(), false)
+        let stats = sweep_narinfos(&client, &live, default_prune_start_at(), false)
             .await
             .unwrap();
         assert_eq!(stats.narinfos_checked, 2);
         assert_eq!(stats.narinfos_deleted, 1);
-        assert_eq!(stats.nars_deleted, 1);
     }
 
     #[tokio::test]
-    async fn sweep_dry_run_counts_but_does_not_delete() {
+    async fn sweep_narinfos_dry_run_counts_but_does_not_delete() {
         let mut live: HashSet<String> = HashSet::new();
         live.insert("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string());
 
@@ -1020,18 +1142,17 @@ mod tests {
                 .unwrap(),
         )]);
 
-        let stats = sweep_phase(&client, &live, default_prune_start_at(), true)
+        let stats = sweep_narinfos(&client, &live, default_prune_start_at(), true)
             .await
             .unwrap();
         assert_eq!(stats.narinfos_checked, 2);
         assert_eq!(stats.narinfos_deleted, 1);
-        assert_eq!(stats.nars_deleted, 1);
         // No delete_object calls were made — StaticReplayClient would
         // panic if unexpected requests were sent.
     }
 
     #[tokio::test]
-    async fn sweep_skips_guardrail_prefixes() {
+    async fn sweep_narinfos_skips_guardrail_prefixes() {
         let live: HashSet<String> = HashSet::new();
 
         let client = mock_client(vec![
@@ -1045,24 +1166,7 @@ mod tests {
                     ])))
                     .unwrap(),
             ),
-            // Only the non-guardrail dead narinfo is fetched + deleted
-            ReplayEvent::new(
-                empty_request(),
-                http::Response::builder()
-                    .status(200)
-                    .body(SdkBody::from(narinfo_body(
-                        "deaddeaddeaddeaddeaddeaddeaddead",
-                        &[],
-                    )))
-                    .unwrap(),
-            ),
-            ReplayEvent::new(
-                empty_request(),
-                http::Response::builder()
-                    .status(200)
-                    .body(SdkBody::empty())
-                    .unwrap(),
-            ),
+            // Only the non-guardrail dead narinfo is deleted.
             ReplayEvent::new(
                 empty_request(),
                 http::Response::builder()
@@ -1072,11 +1176,48 @@ mod tests {
             ),
         ]);
 
-        let stats = sweep_phase(&client, &live, default_prune_start_at(), false)
+        let stats = sweep_narinfos(&client, &live, default_prune_start_at(), false)
             .await
             .unwrap();
         // Both narinfos are counted as checked, but generations/ one is skipped
         assert_eq!(stats.narinfos_checked, 2);
+        assert_eq!(stats.narinfos_deleted, 1);
+    }
+
+    #[tokio::test]
+    async fn sweep_narinfos_does_not_touch_nars_when_dead_pair_exists() {
+        // Phase isolation: even when a dead narinfo and its NAR both appear in
+        // the listing, sweep_narinfos must only delete the narinfo. The NAR
+        // (and the eventual decision to delete it) is sweep_nars' problem.
+        // StaticReplayClient panics on extra requests; the absence of a NAR
+        // DELETE event proves the isolation.
+        let live: HashSet<String> = HashSet::new();
+
+        let client = mock_client(vec![
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(list_xml(&[
+                        "deaddeaddeaddeaddeaddeaddeaddead.narinfo",
+                        "nar/deaddeaddeaddeaddeaddeaddeaddead.nar.xz",
+                    ])))
+                    .unwrap(),
+            ),
+            // Only the narinfo DELETE is replayed.
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::empty())
+                    .unwrap(),
+            ),
+        ]);
+
+        let stats = sweep_narinfos(&client, &live, default_prune_start_at(), false)
+            .await
+            .unwrap();
+        assert_eq!(stats.narinfos_checked, 1);
         assert_eq!(stats.narinfos_deleted, 1);
     }
 
@@ -1089,6 +1230,12 @@ mod tests {
         //   A -> B, C    D -> E    F -> G -> H
         //   C -> B (already visited)    B, E, H: leaf nodes
         // Dead: I, J (not reachable from any root)
+        //
+        // Bucket NARs (a, d, i, j only — others not uploaded yet to keep the
+        // test scoped). After the full run we expect:
+        //   - I.narinfo, J.narinfo deleted by sweep_narinfos
+        //   - nar/I.nar.xz, nar/J.nar.xz deleted by sweep_nars (orphan)
+        //   - nar/A.nar.xz, nar/D.nar.xz kept (referenced by live narinfos)
         let a_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let b_hash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let c_hash = "cccccccccccccccccccccccccccccccc";
@@ -1110,6 +1257,48 @@ mod tests {
         let g_refs = &[&format!("{h_hash}-pkg-h") as &str];
         let no_refs: &[&str] = &[];
 
+        // Listings used by the two phases. The narinfo-sweep listing includes
+        // I and J (still in the bucket); the nar-sweep narinfo listing omits
+        // them (sweep_narinfos has just deleted them in the real flow).
+        let pre_sweep_listing = list_xml(&[
+            &format!("{a_hash}.narinfo"),
+            &format!("{b_hash}.narinfo"),
+            &format!("{c_hash}.narinfo"),
+            &format!("{d_hash}.narinfo"),
+            &format!("{e_hash}.narinfo"),
+            &format!("{f_hash}.narinfo"),
+            &format!("{g_hash}.narinfo"),
+            &format!("{h_hash}.narinfo"),
+            &format!("{i_hash}.narinfo"),
+            &format!("{j_hash}.narinfo"),
+            &format!("nar/{a_hash}.nar.xz"),
+            &format!("nar/{d_hash}.nar.xz"),
+            &format!("nar/{i_hash}.nar.xz"),
+            &format!("nar/{j_hash}.nar.xz"),
+            "generations/dom/1/gen-a.json",
+        ]);
+        let post_narinfo_sweep_listing = list_xml(&[
+            &format!("{a_hash}.narinfo"),
+            &format!("{b_hash}.narinfo"),
+            &format!("{c_hash}.narinfo"),
+            &format!("{d_hash}.narinfo"),
+            &format!("{e_hash}.narinfo"),
+            &format!("{f_hash}.narinfo"),
+            &format!("{g_hash}.narinfo"),
+            &format!("{h_hash}.narinfo"),
+            &format!("nar/{a_hash}.nar.xz"),
+            &format!("nar/{d_hash}.nar.xz"),
+            &format!("nar/{i_hash}.nar.xz"),
+            &format!("nar/{j_hash}.nar.xz"),
+            "generations/dom/1/gen-a.json",
+        ]);
+        let nar_listing = list_xml(&[
+            &format!("nar/{a_hash}.nar.xz"),
+            &format!("nar/{d_hash}.nar.xz"),
+            &format!("nar/{i_hash}.nar.xz"),
+            &format!("nar/{j_hash}.nar.xz"),
+        ]);
+
         let client = mock_client(vec![
             // ── mark_phase ──
             // list_objects("generations/")
@@ -1124,7 +1313,6 @@ mod tests {
                     ])))
                     .unwrap(),
             ),
-            // get_object("generations/dom/1/gen-a.json")
             ReplayEvent::new(
                 empty_request(),
                 http::Response::builder()
@@ -1134,7 +1322,6 @@ mod tests {
                     ))))
                     .unwrap(),
             ),
-            // get_object("generations/dom/1/gen-d.json")
             ReplayEvent::new(
                 empty_request(),
                 http::Response::builder()
@@ -1144,7 +1331,6 @@ mod tests {
                     ))))
                     .unwrap(),
             ),
-            // get_object("generations/dom/1/gen-f.json")
             ReplayEvent::new(
                 empty_request(),
                 http::Response::builder()
@@ -1154,7 +1340,7 @@ mod tests {
                     ))))
                     .unwrap(),
             ),
-            // BFS: get A.narinfo → refs [B, C]
+            // Wave 1: A.narinfo → refs [B, C]
             ReplayEvent::new(
                 empty_request(),
                 http::Response::builder()
@@ -1162,7 +1348,6 @@ mod tests {
                     .body(SdkBody::from(narinfo_body(a_hash, a_refs)))
                     .unwrap(),
             ),
-            // get D.narinfo → refs [E]
             ReplayEvent::new(
                 empty_request(),
                 http::Response::builder()
@@ -1170,7 +1355,6 @@ mod tests {
                     .body(SdkBody::from(narinfo_body(d_hash, d_refs)))
                     .unwrap(),
             ),
-            // get F.narinfo → refs [G]
             ReplayEvent::new(
                 empty_request(),
                 http::Response::builder()
@@ -1178,7 +1362,7 @@ mod tests {
                     .body(SdkBody::from(narinfo_body(f_hash, f_refs)))
                     .unwrap(),
             ),
-            // get B.narinfo → no refs
+            // Wave 2
             ReplayEvent::new(
                 empty_request(),
                 http::Response::builder()
@@ -1186,7 +1370,6 @@ mod tests {
                     .body(SdkBody::from(narinfo_body(b_hash, no_refs)))
                     .unwrap(),
             ),
-            // get C.narinfo → refs [B] (already visited)
             ReplayEvent::new(
                 empty_request(),
                 http::Response::builder()
@@ -1194,7 +1377,6 @@ mod tests {
                     .body(SdkBody::from(narinfo_body(c_hash, c_refs)))
                     .unwrap(),
             ),
-            // get E.narinfo → no refs
             ReplayEvent::new(
                 empty_request(),
                 http::Response::builder()
@@ -1202,7 +1384,6 @@ mod tests {
                     .body(SdkBody::from(narinfo_body(e_hash, no_refs)))
                     .unwrap(),
             ),
-            // get G.narinfo → refs [H]
             ReplayEvent::new(
                 empty_request(),
                 http::Response::builder()
@@ -1210,7 +1391,7 @@ mod tests {
                     .body(SdkBody::from(narinfo_body(g_hash, g_refs)))
                     .unwrap(),
             ),
-            // get H.narinfo → no refs
+            // Wave 3
             ReplayEvent::new(
                 empty_request(),
                 http::Response::builder()
@@ -1218,39 +1399,15 @@ mod tests {
                     .body(SdkBody::from(narinfo_body(h_hash, no_refs)))
                     .unwrap(),
             ),
-            // ── sweep_phase ──
-            // list_objects("") — 10 narinfo keys + extras
+            // ── sweep_narinfos ──
             ReplayEvent::new(
                 empty_request(),
                 http::Response::builder()
                     .status(200)
-                    .body(SdkBody::from(list_xml(&[
-                        &format!("{a_hash}.narinfo"),
-                        &format!("{b_hash}.narinfo"),
-                        &format!("{c_hash}.narinfo"),
-                        &format!("{d_hash}.narinfo"),
-                        &format!("{e_hash}.narinfo"),
-                        &format!("{f_hash}.narinfo"),
-                        &format!("{g_hash}.narinfo"),
-                        &format!("{h_hash}.narinfo"),
-                        &format!("{i_hash}.narinfo"),
-                        &format!("{j_hash}.narinfo"),
-                        &format!("nar/{a_hash}.nar.xz"),
-                        &format!("nar/{d_hash}.nar.xz"),
-                        &format!("nar/{i_hash}.nar.xz"),
-                        &format!("nar/{j_hash}.nar.xz"),
-                        "generations/dom/1/gen-a.json",
-                    ])))
+                    .body(SdkBody::from(pre_sweep_listing))
                     .unwrap(),
             ),
-            // I.narinfo (dead) → fetch + delete
-            ReplayEvent::new(
-                empty_request(),
-                http::Response::builder()
-                    .status(200)
-                    .body(SdkBody::from(narinfo_body(i_hash, no_refs)))
-                    .unwrap(),
-            ),
+            // DELETE I.narinfo
             ReplayEvent::new(
                 empty_request(),
                 http::Response::builder()
@@ -1258,6 +1415,7 @@ mod tests {
                     .body(SdkBody::empty())
                     .unwrap(),
             ),
+            // DELETE J.narinfo
             ReplayEvent::new(
                 empty_request(),
                 http::Response::builder()
@@ -1265,14 +1423,80 @@ mod tests {
                     .body(SdkBody::empty())
                     .unwrap(),
             ),
-            // J.narinfo (dead) → fetch + delete
+            // ── sweep_nars: URL collection ──
             ReplayEvent::new(
                 empty_request(),
                 http::Response::builder()
                     .status(200)
-                    .body(SdkBody::from(narinfo_body(j_hash, no_refs)))
+                    .body(SdkBody::from(post_narinfo_sweep_listing))
                     .unwrap(),
             ),
+            // GET each surviving narinfo for its URL (A..H, listing order).
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(narinfo_body(a_hash, a_refs)))
+                    .unwrap(),
+            ),
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(narinfo_body(b_hash, no_refs)))
+                    .unwrap(),
+            ),
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(narinfo_body(c_hash, c_refs)))
+                    .unwrap(),
+            ),
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(narinfo_body(d_hash, d_refs)))
+                    .unwrap(),
+            ),
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(narinfo_body(e_hash, no_refs)))
+                    .unwrap(),
+            ),
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(narinfo_body(f_hash, f_refs)))
+                    .unwrap(),
+            ),
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(narinfo_body(g_hash, g_refs)))
+                    .unwrap(),
+            ),
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(narinfo_body(h_hash, no_refs)))
+                    .unwrap(),
+            ),
+            // ── sweep_nars: NAR sweep ──
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(nar_listing))
+                    .unwrap(),
+            ),
+            // DELETE nar/I.nar.xz (orphan)
             ReplayEvent::new(
                 empty_request(),
                 http::Response::builder()
@@ -1280,6 +1504,7 @@ mod tests {
                     .body(SdkBody::empty())
                     .unwrap(),
             ),
+            // DELETE nar/J.nar.xz (orphan)
             ReplayEvent::new(
                 empty_request(),
                 http::Response::builder()
@@ -1289,38 +1514,46 @@ mod tests {
             ),
         ]);
 
-        // Act
+        // Run all three phases the way `run` does with `command: None`.
         let live = mark_phase(&client).await.unwrap();
-        let stats = sweep_phase(&client, &live, default_prune_start_at(), false)
+        let narinfo_stats = sweep_narinfos(&client, &live, default_prune_start_at(), false)
+            .await
+            .unwrap();
+        let nar_stats = sweep_nars(&client, default_prune_start_at(), false)
             .await
             .unwrap();
 
-        // Assert mark_phase: 8 live hashes
+        // mark_phase: 8 live hashes
         assert_eq!(live.len(), 8);
-        assert!(live.contains(a_hash));
-        assert!(live.contains(b_hash));
-        assert!(live.contains(c_hash));
-        assert!(live.contains(d_hash));
-        assert!(live.contains(e_hash));
-        assert!(live.contains(f_hash));
-        assert!(live.contains(g_hash));
-        assert!(live.contains(h_hash));
-        assert!(!live.contains(i_hash));
-        assert!(!live.contains(j_hash));
+        for h in [
+            a_hash, b_hash, c_hash, d_hash, e_hash, f_hash, g_hash, h_hash,
+        ] {
+            assert!(live.contains(h));
+        }
+        for h in [i_hash, j_hash] {
+            assert!(!live.contains(h));
+        }
 
-        // Assert sweep_phase stats
-        assert_eq!(stats.narinfos_checked, 10);
-        assert_eq!(stats.narinfos_deleted, 2);
-        assert_eq!(stats.nars_deleted, 2);
+        // sweep_narinfos: only I and J deleted.
+        assert_eq!(narinfo_stats.narinfos_checked, 10);
+        assert_eq!(narinfo_stats.narinfos_deleted, 2);
+
+        // sweep_nars: 2 NARs (A, D) referenced and kept; 2 NARs (I, J) orphan
+        // and deleted.
+        assert_eq!(nar_stats.narinfos_scanned, 8);
+        assert_eq!(nar_stats.referenced_nars, 8);
+        assert_eq!(nar_stats.nars_checked, 4);
+        assert_eq!(nar_stats.nars_kept_referenced, 2);
+        assert_eq!(nar_stats.nars_deleted, 2);
     }
 
-    // ── freshness filter & delete-order tests ──────────────────────
+    // ── sweep_narinfos freshness tests ─────────────────────────────
 
     #[tokio::test]
-    async fn sweep_skips_recently_modified_dead_narinfo() {
+    async fn sweep_narinfos_skips_recently_modified_dead_narinfo() {
         // Dead-by-hash narinfo whose LastModified is *after* prune_start_at:
         // the freshness filter must skip it. StaticReplayClient has only the
-        // listing event — any GET/DELETE would panic as an unexpected request.
+        // listing event — any DELETE would panic as an unexpected request.
         let live: HashSet<String> = HashSet::new();
         let client = mock_client(vec![ReplayEvent::new(
             empty_request(),
@@ -1333,20 +1566,14 @@ mod tests {
                 .unwrap(),
         )]);
 
-        // Cutoff is *before* the narinfo's LastModified.
         let cutoff = Utc.with_ymd_and_hms(2026, 5, 3, 11, 0, 0).unwrap();
-        let stats = sweep_phase(&client, &live, cutoff, false).await.unwrap();
-        // Fresh narinfo is filtered out before the candidate loop runs, so
-        // it isn't counted as "checked".
+        let stats = sweep_narinfos(&client, &live, cutoff, false).await.unwrap();
         assert_eq!(stats.narinfos_checked, 0);
         assert_eq!(stats.narinfos_deleted, 0);
-        assert_eq!(stats.nars_deleted, 0);
     }
 
     #[tokio::test]
-    async fn sweep_deletes_old_dead_narinfo() {
-        // Same shape as above but the narinfo is older than the cutoff.
-        // Sweep must delete it (and its NAR).
+    async fn sweep_narinfos_deletes_old_dead_narinfo() {
         let live: HashSet<String> = HashSet::new();
         let client = mock_client(vec![
             ReplayEvent::new(
@@ -1359,26 +1586,7 @@ mod tests {
                     )])))
                     .unwrap(),
             ),
-            // GET narinfo body to learn the NAR URL
-            ReplayEvent::new(
-                empty_request(),
-                http::Response::builder()
-                    .status(200)
-                    .body(SdkBody::from(narinfo_body(
-                        "deaddeaddeaddeaddeaddeaddeaddead",
-                        &[],
-                    )))
-                    .unwrap(),
-            ),
-            // DELETE NAR (first by new ordering)
-            ReplayEvent::new(
-                empty_request(),
-                http::Response::builder()
-                    .status(200)
-                    .body(SdkBody::empty())
-                    .unwrap(),
-            ),
-            // DELETE narinfo (second)
+            // DELETE narinfo
             ReplayEvent::new(
                 empty_request(),
                 http::Response::builder()
@@ -1389,66 +1597,14 @@ mod tests {
         ]);
 
         let cutoff = Utc.with_ymd_and_hms(2026, 5, 3, 0, 0, 0).unwrap();
-        let stats = sweep_phase(&client, &live, cutoff, false).await.unwrap();
+        let stats = sweep_narinfos(&client, &live, cutoff, false).await.unwrap();
         assert_eq!(stats.narinfos_checked, 1);
         assert_eq!(stats.narinfos_deleted, 1);
-        assert_eq!(stats.nars_deleted, 1);
     }
 
     #[tokio::test]
-    async fn sweep_skips_narinfo_when_nar_delete_fails() {
-        // If the NAR delete returns 500, the narinfo must NOT be deleted —
-        // we'd otherwise strand a NAR with no narinfo (no hash trail to find
-        // it next sweep). StaticReplayClient panics on extra requests, so a
-        // missing narinfo DELETE event proves the skip.
+    async fn sweep_narinfos_skips_narinfo_with_missing_last_modified() {
         let live: HashSet<String> = HashSet::new();
-        let client = mock_client(vec![
-            ReplayEvent::new(
-                empty_request(),
-                http::Response::builder()
-                    .status(200)
-                    .body(SdkBody::from(list_xml(&[
-                        "deaddeaddeaddeaddeaddeaddeaddead.narinfo",
-                    ])))
-                    .unwrap(),
-            ),
-            // GET narinfo body
-            ReplayEvent::new(
-                empty_request(),
-                http::Response::builder()
-                    .status(200)
-                    .body(SdkBody::from(narinfo_body(
-                        "deaddeaddeaddeaddeaddeaddeaddead",
-                        &[],
-                    )))
-                    .unwrap(),
-            ),
-            // DELETE NAR — fails
-            ReplayEvent::new(
-                empty_request(),
-                http::Response::builder()
-                    .status(500)
-                    .body(SdkBody::from("internal error"))
-                    .unwrap(),
-            ),
-            // (NO narinfo DELETE — that's the assertion)
-        ]);
-
-        let stats = sweep_phase(&client, &live, default_prune_start_at(), false)
-            .await
-            .unwrap();
-        assert_eq!(stats.narinfos_checked, 1);
-        assert_eq!(stats.narinfos_deleted, 0);
-        assert_eq!(stats.nars_deleted, 0);
-    }
-
-    #[tokio::test]
-    async fn sweep_skips_narinfo_with_missing_last_modified() {
-        // A narinfo whose listing entry omits LastModified must be treated
-        // as "can't reason about its age" → skip rather than risk deleting
-        // an in-flight upload.
-        let live: HashSet<String> = HashSet::new();
-        // Hand-roll listing XML without <LastModified>.
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <ListBucketResult>
   <Contents><Key>deaddeaddeaddeaddeaddeaddeaddead.narinfo</Key></Contents>
@@ -1461,13 +1617,276 @@ mod tests {
                 .unwrap(),
         )]);
 
-        let stats = sweep_phase(&client, &live, default_prune_start_at(), false)
+        let stats = sweep_narinfos(&client, &live, default_prune_start_at(), false)
             .await
             .unwrap();
-        // Missing-LastModified narinfo is filtered out before the candidate
-        // loop, so it isn't counted as "checked".
         assert_eq!(stats.narinfos_checked, 0);
         assert_eq!(stats.narinfos_deleted, 0);
+    }
+
+    // ── sweep_nars tests ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn sweep_nars_keeps_referenced_dedup() {
+        // The CI symptom regression. Two narinfos A and B with identical
+        // URL nar/X.nar.xz; only B is reachable from any generation root.
+        // Even though A is dead (no longer in the bucket post-narinfo-sweep),
+        // B's URL keeps nar/X.nar.xz alive. StaticReplayClient panics on
+        // unexpected requests — the absence of a DELETE event for the NAR
+        // is the assertion.
+        let client = mock_client(vec![
+            // list "" for narinfo URL collection
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(list_xml(&[
+                        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.narinfo",
+                        "nar/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.nar.xz",
+                    ])))
+                    .unwrap(),
+            ),
+            // GET B.narinfo — its URL is the shared nar/X.nar.xz
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(format!(
+                        "StorePath: /nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-pkg\n\
+                         URL: nar/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.nar.xz\n\
+                         References:\n"
+                    )))
+                    .unwrap(),
+            ),
+            // list "nar/" for orphan sweep
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(list_xml(&[
+                        "nar/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.nar.xz",
+                    ])))
+                    .unwrap(),
+            ),
+            // No DELETE — the NAR is referenced by B.
+        ]);
+
+        let stats = sweep_nars(&client, default_prune_start_at(), false)
+            .await
+            .unwrap();
+        assert_eq!(stats.narinfos_scanned, 1);
+        assert_eq!(stats.referenced_nars, 1);
+        assert_eq!(stats.nars_checked, 1);
+        assert_eq!(stats.nars_kept_referenced, 1);
         assert_eq!(stats.nars_deleted, 0);
+    }
+
+    #[tokio::test]
+    async fn sweep_nars_deletes_orphan_nar() {
+        // Empty narinfo set; one NAR exists. It's orphan → delete.
+        let client = mock_client(vec![
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(list_xml(&[
+                        "nar/orphan00000000000000000000000000.nar.xz",
+                    ])))
+                    .unwrap(),
+            ),
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(list_xml(&[
+                        "nar/orphan00000000000000000000000000.nar.xz",
+                    ])))
+                    .unwrap(),
+            ),
+            // DELETE the orphan
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::empty())
+                    .unwrap(),
+            ),
+        ]);
+
+        let stats = sweep_nars(&client, default_prune_start_at(), false)
+            .await
+            .unwrap();
+        assert_eq!(stats.narinfos_scanned, 0);
+        assert_eq!(stats.referenced_nars, 0);
+        assert_eq!(stats.nars_checked, 1);
+        assert_eq!(stats.nars_deleted, 1);
+    }
+
+    #[tokio::test]
+    async fn sweep_nars_keeps_dead_narinfos_referenced_nar() {
+        // Phase isolation: a dead narinfo that sweep_narinfos hasn't yet
+        // deleted (or failed to delete) still shows up in this phase's
+        // narinfo scan and protects its NAR. Re-running fixes it; nothing
+        // gets stranded mid-sweep.
+        let client = mock_client(vec![
+            // list "" for URL collection — dead narinfo still present
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(list_xml(&[
+                        "deaddeaddeaddeaddeaddeaddeaddead.narinfo",
+                    ])))
+                    .unwrap(),
+            ),
+            // GET the still-present dead narinfo
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(narinfo_body(
+                        "deaddeaddeaddeaddeaddeaddeaddead",
+                        &[],
+                    )))
+                    .unwrap(),
+            ),
+            // list "nar/"
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(list_xml(&[
+                        "nar/deaddeaddeaddeaddeaddeaddeaddead.nar.xz",
+                    ])))
+                    .unwrap(),
+            ),
+            // No DELETE — the NAR is "referenced" (by the surviving dead narinfo)
+        ]);
+
+        let stats = sweep_nars(&client, default_prune_start_at(), false)
+            .await
+            .unwrap();
+        assert_eq!(stats.nars_kept_referenced, 1);
+        assert_eq!(stats.nars_deleted, 0);
+    }
+
+    #[tokio::test]
+    async fn sweep_nars_skips_recently_modified_nar() {
+        // In-flight push protection on the NAR side: a NAR uploaded after
+        // the cutoff must not be deleted even when no narinfo references it
+        // yet (the narinfo upload may not have landed).
+        let client = mock_client(vec![
+            // No narinfos
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(list_xml(&[])))
+                    .unwrap(),
+            ),
+            // Recent NAR
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(list_xml_with_times(&[(
+                        "nar/recent00000000000000000000000000.nar.xz",
+                        "2026-05-09T23:59:00.000Z",
+                    )])))
+                    .unwrap(),
+            ),
+            // No DELETE — freshness filter skipped it.
+        ]);
+
+        let cutoff = Utc.with_ymd_and_hms(2026, 5, 9, 23, 0, 0).unwrap();
+        let stats = sweep_nars(&client, cutoff, false).await.unwrap();
+        assert_eq!(stats.nars_checked, 0);
+        assert_eq!(stats.nars_deleted, 0);
+    }
+
+    #[tokio::test]
+    async fn sweep_nars_dry_run_does_not_delete() {
+        let client = mock_client(vec![
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(list_xml(&[])))
+                    .unwrap(),
+            ),
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(list_xml(&[
+                        "nar/orphan00000000000000000000000000.nar.xz",
+                    ])))
+                    .unwrap(),
+            ),
+            // No DELETE — dry run.
+        ]);
+
+        let stats = sweep_nars(&client, default_prune_start_at(), true)
+            .await
+            .unwrap();
+        assert_eq!(stats.nars_checked, 1);
+        assert_eq!(stats.nars_deleted, 1);
+    }
+
+    #[tokio::test]
+    async fn sweep_nars_aborts_on_unparseable_narinfo() {
+        // A narinfo whose body fetches OK but doesn't parse must abort the
+        // phase. Continuing would silently drop a referenced URL and risk
+        // deleting a still-live NAR. Bucket has both a NAR and a corrupt
+        // narinfo; absence of any DELETE event is part of the assertion
+        // (StaticReplayClient panics on unexpected requests).
+        let client = mock_client(vec![
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(list_xml(&[
+                        "corrupt000000000000000000000000.narinfo",
+                    ])))
+                    .unwrap(),
+            ),
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from("not a real narinfo body"))
+                    .unwrap(),
+            ),
+        ]);
+
+        let result = sweep_nars(&client, default_prune_start_at(), false).await;
+        assert!(
+            result.is_err(),
+            "unparseable narinfo must abort URL collection to avoid deleting live NARs"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_nars_aborts_on_narinfo_get_5xx() {
+        // A non-404 GET on a narinfo during URL collection must abort the
+        // phase. Treating a transient error as "no URL contributed" would
+        // delete live NARs.
+        let mut events = vec![ReplayEvent::new(
+            empty_request(),
+            http::Response::builder()
+                .status(200)
+                .body(SdkBody::from(list_xml(&[
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narinfo",
+                ])))
+                .unwrap(),
+        )];
+        events.extend(server_error_events(5));
+        let client = mock_client(events);
+
+        let result = sweep_nars(&client, default_prune_start_at(), false).await;
+        assert!(
+            result.is_err(),
+            "non-404 narinfo GET errors during URL collection must abort to avoid deleting live NARs"
+        );
     }
 }
