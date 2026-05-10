@@ -814,7 +814,6 @@ mod tests {
     fn generation_json(store_path: &str) -> String {
         format!(
             r#"{{
-  "version": 1,
   "timestamp": "2026-01-01T00:00:00Z",
   "storePath": "{store_path}"
 }}"#
