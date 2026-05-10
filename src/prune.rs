@@ -497,56 +497,60 @@ pub async fn sweep_nars(
 ) -> Result<NarSweepStats> {
     tracing::info!("scanning narinfos to build referenced NAR set");
 
-    let mut narinfo_objects = s3
-        .list_objects("")
-        .try_filter(|o| futures::future::ready(s3_keys::is_narinfo_key(&o.key)))
-        .boxed();
-
-    let mut referenced_nar_keys: HashSet<String> = HashSet::new();
     let mut narinfos_scanned = 0usize;
 
-    while let Some(obj) = narinfo_objects.try_next().await? {
-        let key = &obj.key;
-
-        // Defensive: skip stray narinfo-suffixed keys under reserved prefixes.
-        if key.starts_with("generations/") || key == "nix-cache-info" {
-            continue;
-        }
-
-        narinfos_scanned += 1;
-
-        let body = match s3.get_object(key).await {
-            Ok(b) => b,
-            Err(e) => {
-                if is_not_found(&e) {
+    let referenced_nar_keys: HashSet<String> = s3
+        .list_objects("")
+        .map_ok(|o| o.key)
+        .try_filter(|k| futures::future::ready(s3_keys::is_narinfo_key(k)))
+        .try_filter(|k| {
+            // Defensive: skip stray narinfo-suffixed keys under reserved prefixes.
+            futures::future::ready(!k.starts_with("generations/") && k != "nix-cache-info")
+        })
+        .map_ok(|key| async move {
+            let body = match s3.get_object(&key).await {
+                Ok(b) => b,
+                Err(e) if is_not_found(&e) => {
                     // Narinfo was deleted between listing and GET — fine, it
                     // can't be protecting any NAR if it isn't there.
-                    continue;
+                    return Ok(None);
                 }
-                return Err(e.context(format!("failed to fetch narinfo {key} during NAR sweep")));
+                Err(e) => {
+                    return Err(
+                        e.context(format!("failed to fetch narinfo {key} during NAR sweep"))
+                    );
+                }
+            };
+
+            let body_str = std::str::from_utf8(&body).with_context(|| {
+                format!(
+                    "narinfo {key} body is not valid UTF-8 during NAR sweep; \
+                     aborting rather than risk deleting NARs we can't reason about. \
+                     If this narinfo is genuinely corrupt, delete it manually and \
+                     re-run prune."
+                )
+            })?;
+
+            let info = narinfo::parse_narinfo(body_str).with_context(|| {
+                format!(
+                    "narinfo {key} failed to parse during NAR sweep; aborting \
+                     rather than risk deleting NARs we can't reason about. If \
+                     this narinfo is genuinely corrupt, delete it manually and \
+                     re-run prune."
+                )
+            })?;
+
+            Ok(Some(info.url))
+        })
+        .try_buffer_unordered(MARK_CONCURRENCY)
+        .inspect_ok(|opt| {
+            if opt.is_some() {
+                narinfos_scanned += 1;
             }
-        };
-
-        let body_str = std::str::from_utf8(&body).with_context(|| {
-            format!(
-                "narinfo {key} body is not valid UTF-8 during NAR sweep; \
-                 aborting rather than risk deleting NARs we can't reason about. \
-                 If this narinfo is genuinely corrupt, delete it manually and \
-                 re-run prune."
-            )
-        })?;
-
-        let info = narinfo::parse_narinfo(body_str).with_context(|| {
-            format!(
-                "narinfo {key} failed to parse during NAR sweep; aborting \
-                 rather than risk deleting NARs we can't reason about. If \
-                 this narinfo is genuinely corrupt, delete it manually and \
-                 re-run prune."
-            )
-        })?;
-
-        referenced_nar_keys.insert(info.url);
-    }
+        })
+        .try_filter_map(|opt| async move { Ok(opt) })
+        .try_collect()
+        .await?;
 
     tracing::info!(
         narinfos_scanned,
