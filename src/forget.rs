@@ -147,6 +147,7 @@ pub async fn run(args: ForgetArgs) -> Result<()> {
     if args.prune {
         tracing::info!("chaining into prune");
         let prune_args = crate::prune::PruneArgs {
+            command: None,
             bucket: args.bucket,
             region: args.region,
             endpoint: args.endpoint,
