@@ -52,7 +52,6 @@ Each generation root file is a JSON document:
 
 ```json
 {
-  "version": 1,
   "timestamp": "2026-05-10T12:00:00Z",
   "storePath": "/nix/store/x4ay…-nix-s3-generations-closure-root"
 }
