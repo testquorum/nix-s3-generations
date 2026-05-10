@@ -62,6 +62,19 @@ pub enum PruneSubcommand {
 }
 
 pub async fn run(args: PruneArgs) -> Result<()> {
+    // Combined dry-run is meaningless: phase 1 wouldn't actually delete
+    // narinfos, so phase 2 would still see them in its URL scan and
+    // protect every NAR. The reported orphan-NAR count would always be
+    // zero. Force the user to dry-run a single half at a time.
+    if args.dry_run && args.command.is_none() {
+        anyhow::bail!(
+            "--dry-run requires a subcommand (`narinfo` or `nar`): \
+             a combined dry-run can't carry the simulated narinfo \
+             deletions into the NAR phase, so its NAR sweep stats \
+             would be wrong"
+        );
+    }
+
     let s3 = S3Client::new(
         args.bucket.clone(),
         args.region.clone(),
@@ -89,20 +102,52 @@ pub async fn run(args: PruneArgs) -> Result<()> {
             // Default: both halves, narinfo first so phase 2's URL scan sees
             // only the surviving narinfos.
             let live_hashes = mark_phase(&s3).await?;
-            sweep_narinfos(&s3, &live_hashes, prune_start_at, args.dry_run).await?;
-            sweep_nars(&s3, prune_start_at, args.dry_run).await?;
+            let narinfo_stats =
+                sweep_narinfos(&s3, &live_hashes, prune_start_at, args.dry_run).await?;
+            let nar_stats = sweep_nars(&s3, prune_start_at, args.dry_run).await?;
+            log_narinfo_sweep_stats(&narinfo_stats, args.dry_run);
+            log_nar_sweep_stats(&nar_stats, args.dry_run);
+            tracing::info!(
+                total_bytes_deleted = narinfo_stats.bytes_deleted + nar_stats.bytes_deleted,
+                "prune totals",
+            );
         }
         Some(PruneSubcommand::Narinfo) => {
             let live_hashes = mark_phase(&s3).await?;
-            sweep_narinfos(&s3, &live_hashes, prune_start_at, args.dry_run).await?;
+            let stats = sweep_narinfos(&s3, &live_hashes, prune_start_at, args.dry_run).await?;
+            log_narinfo_sweep_stats(&stats, args.dry_run);
         }
         Some(PruneSubcommand::Nar) => {
-            sweep_nars(&s3, prune_start_at, args.dry_run).await?;
+            let stats = sweep_nars(&s3, prune_start_at, args.dry_run).await?;
+            log_nar_sweep_stats(&stats, args.dry_run);
         }
     }
 
     tracing::info!("prune complete");
     Ok(())
+}
+
+fn log_narinfo_sweep_stats(stats: &NarinfoSweepStats, dry_run: bool) {
+    tracing::info!(
+        narinfos_checked = stats.narinfos_checked,
+        narinfos_deleted = stats.narinfos_deleted,
+        bytes_deleted = stats.bytes_deleted,
+        dry_run,
+        "narinfo sweep complete",
+    );
+}
+
+fn log_nar_sweep_stats(stats: &NarSweepStats, dry_run: bool) {
+    tracing::info!(
+        narinfos_scanned = stats.narinfos_scanned,
+        referenced_nars = stats.referenced_nars,
+        nars_checked = stats.nars_checked,
+        nars_deleted = stats.nars_deleted,
+        nars_kept_referenced = stats.nars_kept_referenced,
+        bytes_deleted = stats.bytes_deleted,
+        dry_run,
+        "NAR sweep complete",
+    );
 }
 
 /// State of a NARinfo during mark phase traversal.
@@ -324,13 +369,20 @@ async fn fetch_and_parse_narinfo(
 }
 
 /// Statistics produced by `sweep_narinfos`.
+///
+/// `bytes_deleted` sums the `Size` field reported by S3 for every narinfo
+/// counted in `narinfos_deleted` — including dry-run "would delete" hits.
 #[derive(Debug, Default)]
 pub struct NarinfoSweepStats {
     pub narinfos_checked: usize,
     pub narinfos_deleted: usize,
+    pub bytes_deleted: u64,
 }
 
 /// Statistics produced by `sweep_nars`.
+///
+/// `bytes_deleted` sums the `Size` field reported by S3 for every NAR
+/// counted in `nars_deleted` — including dry-run "would delete" hits.
 #[derive(Debug, Default)]
 pub struct NarSweepStats {
     pub narinfos_scanned: usize,
@@ -338,6 +390,7 @@ pub struct NarSweepStats {
     pub nars_checked: usize,
     pub nars_deleted: usize,
     pub nars_kept_referenced: usize,
+    pub bytes_deleted: u64,
 }
 
 /// Delete narinfos whose hash isn't in `live_hashes`. Does **not** touch
@@ -431,16 +484,20 @@ pub async fn sweep_narinfos(
             continue;
         }
 
+        let bytes = obj.size.unwrap_or(0) as u64;
+
         if dry_run {
-            tracing::info!(key = key.as_str(), "[DRY RUN] would delete narinfo");
+            tracing::info!(key = key.as_str(), bytes, "[DRY RUN] would delete narinfo");
             stats.narinfos_deleted += 1;
+            stats.bytes_deleted += bytes;
             continue;
         }
 
-        tracing::info!(key = key.as_str(), "deleting dead narinfo");
+        tracing::info!(key = key.as_str(), bytes, "deleting dead narinfo");
         match s3.delete_object(key).await {
             Ok(_) => {
                 stats.narinfos_deleted += 1;
+                stats.bytes_deleted += bytes;
             }
             Err(e) => {
                 tracing::error!(
@@ -451,13 +508,6 @@ pub async fn sweep_narinfos(
             }
         }
     }
-
-    tracing::info!(
-        narinfos_checked = stats.narinfos_checked,
-        narinfos_deleted = stats.narinfos_deleted,
-        dry_run = dry_run,
-        "narinfo sweep complete",
-    );
 
     Ok(stats)
 }
@@ -609,16 +659,24 @@ pub async fn sweep_nars(
             continue;
         }
 
+        let bytes = obj.size.unwrap_or(0) as u64;
+
         if dry_run {
-            tracing::info!(key = key.as_str(), "[DRY RUN] would delete orphan NAR");
+            tracing::info!(
+                key = key.as_str(),
+                bytes,
+                "[DRY RUN] would delete orphan NAR"
+            );
             stats.nars_deleted += 1;
+            stats.bytes_deleted += bytes;
             continue;
         }
 
-        tracing::info!(key = key.as_str(), "deleting orphan NAR");
+        tracing::info!(key = key.as_str(), bytes, "deleting orphan NAR");
         match s3.delete_object(key).await {
             Ok(_) => {
                 stats.nars_deleted += 1;
+                stats.bytes_deleted += bytes;
             }
             Err(e) => {
                 tracing::error!(
@@ -629,16 +687,6 @@ pub async fn sweep_nars(
             }
         }
     }
-
-    tracing::info!(
-        narinfos_scanned = stats.narinfos_scanned,
-        referenced_nars = stats.referenced_nars,
-        nars_checked = stats.nars_checked,
-        nars_deleted = stats.nars_deleted,
-        nars_kept_referenced = stats.nars_kept_referenced,
-        dry_run = dry_run,
-        "NAR sweep complete",
-    );
 
     Ok(stats)
 }
@@ -688,12 +736,18 @@ mod tests {
     /// freshness filter (`prune_start_at`) will treat them as deletable.
     const OLD_LAST_MODIFIED: &str = "2020-01-01T00:00:00.000Z";
 
+    /// Default per-object size for tests that don't care about specific
+    /// byte counts. Non-zero so any "bytes_deleted == 0" assertion would
+    /// fail loud, but small enough that round numbers in tests remain
+    /// readable.
+    const DEFAULT_SIZE: u64 = 100;
+
     fn list_xml(keys: &[&str]) -> String {
         let contents: String = keys
             .iter()
             .map(|k| {
                 format!(
-                    "  <Contents><Key>{k}</Key><LastModified>{OLD_LAST_MODIFIED}</LastModified></Contents>\n"
+                    "  <Contents><Key>{k}</Key><LastModified>{OLD_LAST_MODIFIED}</LastModified><Size>{DEFAULT_SIZE}</Size></Contents>\n"
                 )
             })
             .collect();
@@ -710,7 +764,24 @@ mod tests {
         let contents: String = items
             .iter()
             .map(|(k, ts)| {
-                format!("  <Contents><Key>{k}</Key><LastModified>{ts}</LastModified></Contents>\n")
+                format!("  <Contents><Key>{k}</Key><LastModified>{ts}</LastModified><Size>{DEFAULT_SIZE}</Size></Contents>\n")
+            })
+            .collect();
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult>
+{contents}</ListBucketResult>"#
+        )
+    }
+
+    /// Like `list_xml` but lets the test set per-key sizes (in bytes).
+    fn list_xml_with_sizes(items: &[(&str, u64)]) -> String {
+        let contents: String = items
+            .iter()
+            .map(|(k, sz)| {
+                format!(
+                    "  <Contents><Key>{k}</Key><LastModified>{OLD_LAST_MODIFIED}</LastModified><Size>{sz}</Size></Contents>\n"
+                )
             })
             .collect();
         format!(
@@ -1128,6 +1199,7 @@ mod tests {
             .unwrap();
         assert_eq!(stats.narinfos_checked, 2);
         assert_eq!(stats.narinfos_deleted, 1);
+        assert_eq!(stats.bytes_deleted, DEFAULT_SIZE);
     }
 
     #[tokio::test]
@@ -1151,8 +1223,50 @@ mod tests {
             .unwrap();
         assert_eq!(stats.narinfos_checked, 2);
         assert_eq!(stats.narinfos_deleted, 1);
+        // Dry-run still tallies bytes that would have been deleted.
+        assert_eq!(stats.bytes_deleted, DEFAULT_SIZE);
         // No delete_object calls were made — StaticReplayClient would
         // panic if unexpected requests were sent.
+    }
+
+    #[tokio::test]
+    async fn sweep_narinfos_bytes_deleted_sums_per_object_size() {
+        let live: HashSet<String> = HashSet::new();
+
+        let client = mock_client(vec![
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(list_xml_with_sizes(&[
+                        ("deaddeaddeaddeaddeaddeaddeaddead.narinfo", 1234),
+                        ("ff00ff00ff00ff00ff00ff00ff00ff00.narinfo", 5678),
+                    ])))
+                    .unwrap(),
+            ),
+            // DELETE narinfo 1
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::empty())
+                    .unwrap(),
+            ),
+            // DELETE narinfo 2
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::empty())
+                    .unwrap(),
+            ),
+        ]);
+
+        let stats = sweep_narinfos(&client, &live, default_prune_start_at(), false)
+            .await
+            .unwrap();
+        assert_eq!(stats.narinfos_deleted, 2);
+        assert_eq!(stats.bytes_deleted, 1234 + 5678);
     }
 
     #[tokio::test]
@@ -1724,6 +1838,54 @@ mod tests {
         assert_eq!(stats.referenced_nars, 0);
         assert_eq!(stats.nars_checked, 1);
         assert_eq!(stats.nars_deleted, 1);
+        assert_eq!(stats.bytes_deleted, DEFAULT_SIZE);
+    }
+
+    #[tokio::test]
+    async fn sweep_nars_bytes_deleted_sums_per_object_size() {
+        let client = mock_client(vec![
+            // No narinfos — every NAR is orphan.
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(list_xml(&[])))
+                    .unwrap(),
+            ),
+            // nar listing with explicit per-object sizes
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(list_xml_with_sizes(&[
+                        ("nar/orphan00000000000000000000000000.nar.xz", 4096),
+                        ("nar/orphan11111111111111111111111111.nar.xz", 8192),
+                    ])))
+                    .unwrap(),
+            ),
+            // DELETE orphan 1
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::empty())
+                    .unwrap(),
+            ),
+            // DELETE orphan 2
+            ReplayEvent::new(
+                empty_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::empty())
+                    .unwrap(),
+            ),
+        ]);
+
+        let stats = sweep_nars(&client, default_prune_start_at(), false)
+            .await
+            .unwrap();
+        assert_eq!(stats.nars_deleted, 2);
+        assert_eq!(stats.bytes_deleted, 4096 + 8192);
     }
 
     #[tokio::test]
@@ -1835,6 +1997,8 @@ mod tests {
             .unwrap();
         assert_eq!(stats.nars_checked, 1);
         assert_eq!(stats.nars_deleted, 1);
+        // Dry-run still tallies bytes that would have been deleted.
+        assert_eq!(stats.bytes_deleted, DEFAULT_SIZE);
     }
 
     #[tokio::test]
@@ -1891,6 +2055,30 @@ mod tests {
         assert!(
             result.is_err(),
             "non-404 narinfo GET errors during URL collection must abort to avoid deleting live NARs"
+        );
+    }
+
+    // ── run() top-level guards ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_rejects_combined_dry_run() {
+        // No subcommand + --dry-run is rejected up-front: phase 1 wouldn't
+        // delete narinfos, so phase 2's URL scan would still see them and
+        // never report any orphan NAR. Erroring is more honest than
+        // silently producing a misleading 0.
+        let args = PruneArgs {
+            command: None,
+            bucket: "test-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: Some("http://localhost:1".to_string()),
+            dry_run: true,
+            freshness_buffer_secs: DEFAULT_FRESHNESS_BUFFER_SECS,
+        };
+        let err = run(args).await.expect_err("combined dry-run must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--dry-run") && msg.contains("subcommand"),
+            "error should explain why combined dry-run is rejected, got: {msg}"
         );
     }
 }

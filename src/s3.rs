@@ -13,13 +13,15 @@ pub struct S3Client {
     bucket: String,
 }
 
-/// One entry from `list_objects`. `last_modified` is the server-side
-/// `LastModified` reported by S3; `None` only if the listing omits it
-/// (shouldn't happen for `list_objects_v2`, but callers must be defensive).
+/// One entry from `list_objects`. `last_modified` and `size` are the
+/// server-side values reported by S3; either is `None` only if the listing
+/// omits the field (shouldn't happen for `list_objects_v2`, but callers
+/// must be defensive). `size` is in bytes.
 #[derive(Debug, Clone)]
 pub struct S3Object {
     pub key: String,
     pub last_modified: Option<DateTime<Utc>>,
+    pub size: Option<i64>,
 }
 
 impl S3Client {
@@ -124,6 +126,7 @@ impl S3Client {
                                 yield Ok(S3Object {
                                     key: key.to_string(),
                                     last_modified: obj.last_modified().and_then(smithy_to_chrono),
+                                    size: obj.size(),
                                 });
                             }
                         }
