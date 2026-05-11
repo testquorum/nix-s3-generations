@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+mod check;
 mod forget;
 mod generation;
 mod narinfo;
@@ -27,6 +28,8 @@ enum Commands {
     Prune(prune::PruneArgs),
     /// Forget generation roots according to a retention policy
     Forget(forget::ForgetArgs),
+    /// Diagnose (and optionally repair) bucket inconsistencies
+    Check(check::CheckArgs),
 }
 
 #[tokio::main]
@@ -39,5 +42,6 @@ async fn main() -> anyhow::Result<()> {
         Commands::Push(args) => push::run(args).await,
         Commands::Prune(args) => prune::run(args).await,
         Commands::Forget(args) => forget::run(args).await,
+        Commands::Check(args) => check::run(args).await,
     }
 }

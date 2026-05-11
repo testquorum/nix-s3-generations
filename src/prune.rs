@@ -11,7 +11,7 @@ use crate::s3::S3Client;
 use crate::s3_keys;
 
 /// Maximum number of concurrent S3 GETs per mark-phase wave.
-const MARK_CONCURRENCY: usize = 32;
+pub const MARK_CONCURRENCY: usize = 32;
 
 /// Default freshness buffer (seconds): objects whose `LastModified` is within
 /// this window of prune start are protected from sweep. Doubles as
@@ -691,7 +691,7 @@ pub async fn sweep_nars(
     Ok(stats)
 }
 
-fn is_not_found(err: &anyhow::Error) -> bool {
+pub fn is_not_found(err: &anyhow::Error) -> bool {
     for cause in err.chain() {
         if let Some(aws_sdk_s3::error::SdkError::ServiceError(inner)) = cause
             .downcast_ref::<aws_sdk_s3::error::SdkError<
