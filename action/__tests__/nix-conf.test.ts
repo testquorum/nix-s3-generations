@@ -103,4 +103,24 @@ describe("buildPostBuildHook", () => {
       "s3://my-bucket?endpoint=abc.r2.cloudflarestorage.com&region=auto",
     );
   });
+
+  it("retries nix copy with backoff instead of exec-ing it", () => {
+    const hook = buildPostBuildHook({
+      bucket: "my-bucket",
+      region: "auto",
+      endpoint: "abc.r2.cloudflarestorage.com",
+      publicKey: "k",
+    });
+    // We removed the original `exec` form — the shell must stay alive to
+    // observe the exit status and retry.
+    expect(hook).not.toMatch(/exec\s+\S*\bnix\s+copy/);
+    // Retry loop markers: bounded attempts and a backoff sleep.
+    expect(hook).toContain("MAX_ATTEMPTS=4");
+    expect(hook).toContain("while true; do");
+    expect(hook).toContain('sleep "$delay"');
+    expect(hook).toContain("retrying in");
+    // The copy command itself uses `|| status=$?` so failures are captured
+    // rather than swallowed by the `if`-condition's zero return.
+    expect(hook).toMatch(/copy[^\n]*\$OUT_PATHS\s*\|\|\s*status=\$\?/);
+  });
 });
