@@ -34650,6 +34650,12 @@ function buildAwsCredentialsFile(creds) {
 /// Post-build hook script. Runs as root via the Nix daemon after every
 /// successful build; signs and uploads each output path immediately.
 /// AWS credentials are picked up from /root/.aws/credentials by the SDK.
+///
+/// Retries `nix copy` with exponential backoff: the underlying AWS SDK
+/// occasionally aborts mid-transfer on flaky S3 responses (we've observed
+/// SIGABRT on the largest closures), and the surrounding `nix build` fails
+/// loudly when this hook returns non-zero. Retrying in-hook also covers the
+/// user's own build steps, not just our cleanup push.
 function buildPostBuildHook(cfg) {
     const s3Params = buildNixS3Params(cfg);
     const copyUri = `s3://${cfg.bucket}?${s3Params}&secret-key=${SIGNING_KEY_PATH}&compression=zstd`;
@@ -34659,7 +34665,26 @@ function buildPostBuildHook(cfg) {
         "set -o pipefail",
         "",
         'echo "nix-s3-generations: uploading $OUT_PATHS"',
-        `exec /nix/var/nix/profiles/default/bin/nix copy --to "${copyUri}" $OUT_PATHS`,
+        "",
+        "NIX=/nix/var/nix/profiles/default/bin/nix",
+        "MAX_ATTEMPTS=4",
+        "delay=5",
+        "attempt=1",
+        "while true; do",
+        "  status=0",
+        `  "$NIX" copy --to "${copyUri}" $OUT_PATHS || status=$?`,
+        '  if [ "$status" -eq 0 ]; then',
+        "    exit 0",
+        "  fi",
+        '  if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then',
+        '    echo "nix-s3-generations: nix copy failed after $attempt attempts (last status $status)" >&2',
+        '    exit "$status"',
+        "  fi",
+        '  echo "nix-s3-generations: nix copy failed (status $status), retrying in ${delay}s (attempt $attempt/$MAX_ATTEMPTS)" >&2',
+        '  sleep "$delay"',
+        "  attempt=$(( attempt + 1 ))",
+        "  delay=$(( delay * 2 ))",
+        "done",
         "",
     ].join("\n");
 }
