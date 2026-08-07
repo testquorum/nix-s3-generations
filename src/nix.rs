@@ -273,6 +273,22 @@ pub fn build_closure_root<R: NixCommandRunner>(
 /// hook a user has configured for other purposes.
 pub const OUR_POST_BUILD_HOOK_PATH: &str = "/etc/nix/nix-s3-generations-post-build-hook.sh";
 
+/// Invoke `nix copy --to <to_uri> <path>`. Used by the post-push
+/// restoration pass to re-walk the closure and re-upload any narinfo a
+/// racing prune deleted between the original push and the gen root upload.
+/// Existing narinfos are HEAD-skipped by `nix copy`; only missing ones
+/// are re-uploaded from the local store.
+pub fn copy_paths<R: NixCommandRunner>(
+    runner: &R,
+    to_uri: &str,
+    path: &NixStorePath,
+) -> Result<()> {
+    runner
+        .run_nix(&["copy", "--to", to_uri, path.as_str()])
+        .with_context(|| format!("nix copy to {to_uri} failed for {path}"))?;
+    Ok(())
+}
+
 /// Returns true if the active Nix daemon's `post-build-hook` is the one this
 /// action installs. Used purely to make logging accurate: when our hook is
 /// set, `nix build` triggers it on success and the hook uploads the build's
@@ -299,6 +315,11 @@ pub fn our_post_build_hook_installed_real() -> bool {
 /// Convenience wrapper using the real Nix runner.
 pub fn build_closure_root_real(paths: &[NixStorePath]) -> Result<NixStorePath> {
     build_closure_root(&RealNixRunner, paths)
+}
+
+/// Convenience wrapper using the real Nix runner.
+pub fn copy_paths_real(to_uri: &str, path: &NixStorePath) -> Result<()> {
+    copy_paths(&RealNixRunner, to_uri, path)
 }
 
 #[cfg(test)]
@@ -565,5 +586,32 @@ mod tests {
     fn test_our_post_build_hook_installed_handles_failure() {
         let runner = MockRunner::failure("config error", 1);
         assert!(!our_post_build_hook_installed(&runner));
+    }
+
+    #[test]
+    fn test_copy_paths_invokes_nix_copy_with_uri_and_path() {
+        let path = nsp("/nix/store/aaa-pkg");
+        let uri = "s3://b?region=us-east-1&secret-key=/etc/nix/cache-priv-key.pem&compression=zstd";
+        let runner =
+            MockRunner::success("").with_expected_args(&["copy", "--to", uri, path.as_str()]);
+        copy_paths(&runner, uri, &path).unwrap();
+    }
+
+    #[test]
+    fn test_copy_paths_propagates_failure() {
+        let path = nsp("/nix/store/aaa-pkg");
+        let runner = MockRunner::failure("upload failed", 1);
+        let err = copy_paths(&runner, "s3://b?region=us-east-1", &path).unwrap_err();
+        let chain: Vec<String> = err.chain().map(|e| e.to_string()).collect();
+        assert!(
+            chain.iter().any(|m| m.contains("upload failed")),
+            "error chain should contain nix stderr: {:?}",
+            chain
+        );
+        assert!(
+            chain.iter().any(|m| m.contains("nix copy")),
+            "error chain should mention nix copy: {:?}",
+            chain
+        );
     }
 }
