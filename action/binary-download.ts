@@ -13,16 +13,24 @@ export function is404Error(err: unknown): boolean {
   return err instanceof tc.HTTPError && err.httpStatusCode === 404;
 }
 
+/**
+ * Platform string matching `$(uname -m)-$(uname -s)`, which is how CI names
+ * the published closure artifacts. Note macOS reports Apple Silicon as
+ * `arm64`, not `aarch64`.
+ */
 export function detectPlatform(): string {
   const arch = os.machine();
   const sys = os.type();
 
-  if ((arch === "x86_64" || arch === "aarch64") && sys === "Linux") {
+  if (
+    (sys === "Linux" && (arch === "x86_64" || arch === "aarch64")) ||
+    (sys === "Darwin" && (arch === "x86_64" || arch === "arm64"))
+  ) {
     return `${arch}-${sys}`;
   }
 
   throw new Error(
-    `Unsupported platform: ${arch}-${sys}. Supported: x86_64-Linux, aarch64-Linux`,
+    `Unsupported platform: ${arch}-${sys}. Supported: x86_64-Linux, aarch64-Linux, x86_64-Darwin, arm64-Darwin`,
   );
 }
 

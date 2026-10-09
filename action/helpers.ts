@@ -10,13 +10,37 @@ import {
 } from "./state.js";
 
 export const NIX_CONF_PATH = "/etc/nix/nix.conf";
-export const AWS_CREDENTIALS_PATH = "/root/.aws/credentials";
 export const SIGNING_KEY_PATH = "/etc/nix/cache-priv-key.pem";
 // The path is unique to this action so the Rust binary can detect *our*
 // hook (not just any post-build-hook). Must stay in sync with
 // `OUR_POST_BUILD_HOOK_PATH` in src/nix.rs.
 export const POST_BUILD_HOOK_PATH =
   "/etc/nix/nix-s3-generations-post-build-hook.sh";
+
+/// Where the root-owned Nix daemon's AWS SDK looks for credentials: root's
+/// home. macOS keeps that at /var/root, and `/` is a read-only system volume
+/// there, so /root can't even be created.
+export function awsCredentialsPath(
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const rootHome = platform === "darwin" ? "/var/root" : "/root";
+  return `${rootHome}/.aws/credentials`;
+}
+
+/// Commands (each run under sudo) that restart the Nix daemon, tried in order
+/// until one succeeds. macOS has no systemd; the daemon is a launchd job whose
+/// label depends on the installer (upstream vs Determinate).
+export function daemonRestartCommands(
+  platform: NodeJS.Platform = process.platform,
+): string[][] {
+  if (platform === "darwin") {
+    return [
+      ["launchctl", "kickstart", "-k", "system/org.nixos.nix-daemon"],
+      ["launchctl", "kickstart", "-k", "system/systems.determinate.nix-daemon"],
+    ];
+  }
+  return [["systemctl", "restart", "nix-daemon"]];
+}
 
 export interface NixCacheConfig {
   bucket: string;
@@ -70,7 +94,7 @@ export function buildAwsCredentialsFile(creds: AwsCredentials): string {
 
 /// Post-build hook script. Runs as root via the Nix daemon after every
 /// successful build; signs and uploads each output path immediately.
-/// AWS credentials are picked up from /root/.aws/credentials by the SDK.
+/// AWS credentials are picked up from root's ~/.aws/credentials by the SDK.
 ///
 /// Retries `nix copy` with exponential backoff: the underlying AWS SDK
 /// occasionally aborts mid-transfer on flaky S3 responses (we've observed
@@ -142,12 +166,9 @@ export async function configureNixCache(
   creds: AwsCredentials,
   signingKey: string,
 ): Promise<void> {
-  await sudoWriteFile(
-    AWS_CREDENTIALS_PATH,
-    buildAwsCredentialsFile(creds),
-    "0600",
-  );
-  core.info(`Wrote AWS credentials to ${AWS_CREDENTIALS_PATH}`);
+  const credsPath = awsCredentialsPath();
+  await sudoWriteFile(credsPath, buildAwsCredentialsFile(creds), "0600");
+  core.info(`Wrote AWS credentials to ${credsPath}`);
 
   await sudoWriteFile(SIGNING_KEY_PATH, signingKey, "0600");
   core.info(`Wrote signing key to ${SIGNING_KEY_PATH}`);
@@ -161,10 +182,39 @@ export async function configureNixCache(
   core.info(`Appended cache settings to ${NIX_CONF_PATH}`);
 
   // Restart the daemon so it picks up the new substituter, trusted key,
-  // and post-build-hook. Tolerate failure on systems without systemd.
-  await exec.exec("sudo", ["systemctl", "restart", "nix-daemon"], {
-    ignoreReturnCode: true,
-  });
+  // and post-build-hook. Tolerate failure on systems without a managed
+  // daemon (e.g. single-user installs).
+  let restarted = false;
+  for (const cmd of daemonRestartCommands()) {
+    const code = await exec.exec("sudo", cmd, { ignoreReturnCode: true });
+    if (code === 0) {
+      restarted = true;
+      break;
+    }
+  }
+  if (!restarted) {
+    core.warning(
+      "nix-s3-generations: could not restart nix-daemon; cache settings may not take effect until it restarts",
+    );
+    return;
+  }
+  await waitForDaemon();
+}
+
+/// launchd's `kickstart -k` returns once the old daemon is killed, not once
+/// the new one is listening, so the next `nix` call can race the socket.
+/// Poll until the store answers.
+async function waitForDaemon(): Promise<void> {
+  for (let attempt = 0; attempt < 30; attempt++) {
+    const code = await exec.exec(
+      "nix",
+      ["--extra-experimental-features", "nix-command", "store", "info"],
+      { ignoreReturnCode: true, silent: true },
+    );
+    if (code === 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+  core.warning("nix-s3-generations: nix-daemon did not come back within 30s");
 }
 
 export async function runPost(): Promise<void> {
@@ -204,7 +254,7 @@ export async function runPost(): Promise<void> {
   const region = core.getInput("region") || "us-east-1";
   const endpoint = core.getInput("s3-endpoint", { required: true });
 
-  // The binary runs as the runner user — it can't read /root/.aws/credentials,
+  // The binary runs as the runner user — it can't read root's ~/.aws/credentials,
   // and inputs aren't visible to the AWS SDK. Forward the creds explicitly so
   // both `nix copy` and the in-process S3 client can authenticate.
   const accessKeyId =

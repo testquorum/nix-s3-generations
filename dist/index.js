@@ -34592,13 +34592,19 @@ const external_node_os_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import
 function is404Error(err) {
     return err instanceof HTTPError && err.httpStatusCode === 404;
 }
+/**
+ * Platform string matching `$(uname -m)-$(uname -s)`, which is how CI names
+ * the published closure artifacts. Note macOS reports Apple Silicon as
+ * `arm64`, not `aarch64`.
+ */
 function detectPlatform() {
     const arch = external_node_os_namespaceObject.machine();
     const sys = external_node_os_namespaceObject.type();
-    if ((arch === "x86_64" || arch === "aarch64") && sys === "Linux") {
+    if ((sys === "Linux" && (arch === "x86_64" || arch === "aarch64")) ||
+        (sys === "Darwin" && (arch === "x86_64" || arch === "arm64"))) {
         return `${arch}-${sys}`;
     }
-    throw new Error(`Unsupported platform: ${arch}-${sys}. Supported: x86_64-Linux, aarch64-Linux`);
+    throw new Error(`Unsupported platform: ${arch}-${sys}. Supported: x86_64-Linux, aarch64-Linux, x86_64-Darwin, arm64-Darwin`);
 }
 /**
  * Download a closure artifact from R2.
@@ -34717,12 +34723,30 @@ const STATE_BIN_PATH = "STATE_BIN_PATH";
 
 
 const NIX_CONF_PATH = "/etc/nix/nix.conf";
-const AWS_CREDENTIALS_PATH = "/root/.aws/credentials";
 const SIGNING_KEY_PATH = "/etc/nix/cache-priv-key.pem";
 // The path is unique to this action so the Rust binary can detect *our*
 // hook (not just any post-build-hook). Must stay in sync with
 // `OUR_POST_BUILD_HOOK_PATH` in src/nix.rs.
 const POST_BUILD_HOOK_PATH = "/etc/nix/nix-s3-generations-post-build-hook.sh";
+/// Where the root-owned Nix daemon's AWS SDK looks for credentials: root's
+/// home. macOS keeps that at /var/root, and `/` is a read-only system volume
+/// there, so /root can't even be created.
+function awsCredentialsPath(platform = process.platform) {
+    const rootHome = platform === "darwin" ? "/var/root" : "/root";
+    return `${rootHome}/.aws/credentials`;
+}
+/// Commands (each run under sudo) that restart the Nix daemon, tried in order
+/// until one succeeds. macOS has no systemd; the daemon is a launchd job whose
+/// label depends on the installer (upstream vs Determinate).
+function daemonRestartCommands(platform = process.platform) {
+    if (platform === "darwin") {
+        return [
+            ["launchctl", "kickstart", "-k", "system/org.nixos.nix-daemon"],
+            ["launchctl", "kickstart", "-k", "system/systems.determinate.nix-daemon"],
+        ];
+    }
+    return [["systemctl", "restart", "nix-daemon"]];
+}
 /// Substituter URL parameters: encoded as `&`-separated key=value pairs that
 /// follow the bucket name in `s3://{bucket}?...`. Native AWS S3 doesn't need
 /// `endpoint=`; everything else does.
@@ -34758,7 +34782,7 @@ function buildAwsCredentialsFile(creds) {
 }
 /// Post-build hook script. Runs as root via the Nix daemon after every
 /// successful build; signs and uploads each output path immediately.
-/// AWS credentials are picked up from /root/.aws/credentials by the SDK.
+/// AWS credentials are picked up from root's ~/.aws/credentials by the SDK.
 ///
 /// Retries `nix copy` with exponential backoff: the underlying AWS SDK
 /// occasionally aborts mid-transfer on flaky S3 responses (we've observed
@@ -34816,8 +34840,9 @@ async function sudoAppendFile(destPath, content) {
     });
 }
 async function configureNixCache(cfg, creds, signingKey) {
-    await sudoWriteFile(AWS_CREDENTIALS_PATH, buildAwsCredentialsFile(creds), "0600");
-    info(`Wrote AWS credentials to ${AWS_CREDENTIALS_PATH}`);
+    const credsPath = awsCredentialsPath();
+    await sudoWriteFile(credsPath, buildAwsCredentialsFile(creds), "0600");
+    info(`Wrote AWS credentials to ${credsPath}`);
     await sudoWriteFile(SIGNING_KEY_PATH, signingKey, "0600");
     info(`Wrote signing key to ${SIGNING_KEY_PATH}`);
     await sudoWriteFile(POST_BUILD_HOOK_PATH, buildPostBuildHook(cfg), "0755");
@@ -34827,10 +34852,33 @@ async function configureNixCache(cfg, creds, signingKey) {
     await sudoAppendFile(NIX_CONF_PATH, buildNixConf(cfg));
     info(`Appended cache settings to ${NIX_CONF_PATH}`);
     // Restart the daemon so it picks up the new substituter, trusted key,
-    // and post-build-hook. Tolerate failure on systems without systemd.
-    await exec_exec("sudo", ["systemctl", "restart", "nix-daemon"], {
-        ignoreReturnCode: true,
-    });
+    // and post-build-hook. Tolerate failure on systems without a managed
+    // daemon (e.g. single-user installs).
+    let restarted = false;
+    for (const cmd of daemonRestartCommands()) {
+        const code = await exec_exec("sudo", cmd, { ignoreReturnCode: true });
+        if (code === 0) {
+            restarted = true;
+            break;
+        }
+    }
+    if (!restarted) {
+        warning("nix-s3-generations: could not restart nix-daemon; cache settings may not take effect until it restarts");
+        return;
+    }
+    await waitForDaemon();
+}
+/// launchd's `kickstart -k` returns once the old daemon is killed, not once
+/// the new one is listening, so the next `nix` call can race the socket.
+/// Poll until the store answers.
+async function waitForDaemon() {
+    for (let attempt = 0; attempt < 30; attempt++) {
+        const code = await exec_exec("nix", ["--extra-experimental-features", "nix-command", "store", "info"], { ignoreReturnCode: true, silent: true });
+        if (code === 0)
+            return;
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    warning("nix-s3-generations: nix-daemon did not come back within 30s");
 }
 async function runPost() {
     info("nix-s3-generations: post phase");
@@ -34857,7 +34905,7 @@ async function runPost() {
     const bucket = getInput("bucket", { required: true });
     const region = getInput("region") || "us-east-1";
     const endpoint = getInput("s3-endpoint", { required: true });
-    // The binary runs as the runner user — it can't read /root/.aws/credentials,
+    // The binary runs as the runner user — it can't read root's ~/.aws/credentials,
     // and inputs aren't visible to the AWS SDK. Forward the creds explicitly so
     // both `nix copy` and the in-process S3 client can authenticate.
     const accessKeyId = getInput("aws-access-key-id") ||

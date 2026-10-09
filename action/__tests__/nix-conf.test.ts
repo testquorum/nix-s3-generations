@@ -1,9 +1,11 @@
 import { describe, it, expect, vi } from "vitest";
 import {
+  awsCredentialsPath,
   buildAwsCredentialsFile,
   buildNixConf,
   buildNixS3Params,
   buildPostBuildHook,
+  daemonRestartCommands,
   POST_BUILD_HOOK_PATH,
   SIGNING_KEY_PATH,
 } from "../helpers.js";
@@ -122,5 +124,34 @@ describe("buildPostBuildHook", () => {
     // The copy command itself uses `|| status=$?` so failures are captured
     // rather than swallowed by the `if`-condition's zero return.
     expect(hook).toMatch(/copy[^\n]*\$OUT_PATHS\s*\|\|\s*status=\$\?/);
+  });
+});
+
+describe("awsCredentialsPath", () => {
+  it("uses /root on Linux", () => {
+    expect(awsCredentialsPath("linux")).toBe("/root/.aws/credentials");
+  });
+
+  it("uses /var/root on macOS, where / is read-only", () => {
+    expect(awsCredentialsPath("darwin")).toBe("/var/root/.aws/credentials");
+  });
+});
+
+describe("daemonRestartCommands", () => {
+  it("uses systemctl on Linux", () => {
+    expect(daemonRestartCommands("linux")).toEqual([
+      ["systemctl", "restart", "nix-daemon"],
+    ]);
+  });
+
+  it("uses launchctl on macOS, upstream label first", () => {
+    const cmds = daemonRestartCommands("darwin");
+    expect(cmds[0]).toEqual([
+      "launchctl",
+      "kickstart",
+      "-k",
+      "system/org.nixos.nix-daemon",
+    ]);
+    expect(cmds.every((c) => c[0] === "launchctl")).toBe(true);
   });
 });
