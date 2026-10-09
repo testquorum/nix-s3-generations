@@ -40,10 +40,16 @@ describe("detectPlatform", () => {
     expect(detectPlatform()).toBe("aarch64-Linux");
   });
 
-  it("rejects darwin", () => {
+  it("returns arm64-Darwin on Apple Silicon macOS", () => {
     vi.mocked(os.machine).mockReturnValue("arm64");
     vi.mocked(os.type).mockReturnValue("Darwin");
-    expect(() => detectPlatform()).toThrow(/Unsupported platform/);
+    expect(detectPlatform()).toBe("arm64-Darwin");
+  });
+
+  it("returns x86_64-Darwin on Intel macOS", () => {
+    vi.mocked(os.machine).mockReturnValue("x86_64");
+    vi.mocked(os.type).mockReturnValue("Darwin");
+    expect(detectPlatform()).toBe("x86_64-Darwin");
   });
 
   it("rejects windows", () => {

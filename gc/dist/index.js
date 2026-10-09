@@ -34582,13 +34582,19 @@ const external_node_os_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import
 function is404Error(err) {
     return err instanceof HTTPError && err.httpStatusCode === 404;
 }
+/**
+ * Platform string matching `$(uname -m)-$(uname -s)`, which is how CI names
+ * the published closure artifacts. Note macOS reports Apple Silicon as
+ * `arm64`, not `aarch64`.
+ */
 function detectPlatform() {
     const arch = external_node_os_namespaceObject.machine();
     const sys = external_node_os_namespaceObject.type();
-    if ((arch === "x86_64" || arch === "aarch64") && sys === "Linux") {
+    if ((sys === "Linux" && (arch === "x86_64" || arch === "aarch64")) ||
+        (sys === "Darwin" && (arch === "x86_64" || arch === "arm64"))) {
         return `${arch}-${sys}`;
     }
-    throw new Error(`Unsupported platform: ${arch}-${sys}. Supported: x86_64-Linux, aarch64-Linux`);
+    throw new Error(`Unsupported platform: ${arch}-${sys}. Supported: x86_64-Linux, aarch64-Linux, x86_64-Darwin, arm64-Darwin`);
 }
 /**
  * Download a closure artifact from R2.
