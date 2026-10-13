@@ -57,7 +57,7 @@ Each generation root file is a JSON document:
 }
 ```
 
-The `storePath` is a "closure root" — a single Nix derivation whose runtime references are exactly the minimal cover of paths pushed in that generation. Walking its transitive closure via `.narinfo` references finds every reachable path.
+The `storePath` is a "closure root" — a single Nix store path whose references are exactly the minimal cover of paths pushed in that generation. Walking its transitive closure via `.narinfo` references finds every reachable path.
 
 ### How it connects
 
@@ -74,7 +74,7 @@ The `storePath` is a "closure root" — a single Nix derivation whose runtime re
          NAR blobs           delete orphan NARs
 ```
 
-1. **push** — Snapshots the Nix store, builds a closure root, and relies on a post-build hook to upload NARs + narinfos. Writes a generation root JSON to `generations/{domain}/{generation}/{shard-id}.json`.
+1. **push** — Snapshots the Nix store, creates a closure root, and uploads it (NARs + narinfos) with the same root-owned script that runs as the post-build hook. Writes a generation root JSON to `generations/{domain}/{generation}/{shard-id}.json`.
 
 2. **forget** — Enumerates generation roots under `generations/`, applies retention policies (`--keep-last`, `--keep-within`, `--forget-before`), and deletes generation JSONs that fall outside the policy. Optionally chains into `prune`.
 

@@ -4,10 +4,10 @@ import {
   buildAwsCredentialsFile,
   buildNixConf,
   buildNixS3Params,
-  buildPostBuildHook,
+  buildUploadScript,
   daemonRestartCommands,
-  POST_BUILD_HOOK_PATH,
   SIGNING_KEY_PATH,
+  UPLOAD_SCRIPT_PATH,
 } from "../helpers.js";
 
 vi.mock("@actions/core", () => ({
@@ -69,7 +69,7 @@ describe("buildNixConf", () => {
     expect(conf).toContain(
       "extra-trusted-public-keys = my-cache.example.com-1:ABC",
     );
-    expect(conf).toContain(`post-build-hook = ${POST_BUILD_HOOK_PATH}`);
+    expect(conf).toContain(`post-build-hook = ${UPLOAD_SCRIPT_PATH}`);
   });
 });
 
@@ -87,9 +87,9 @@ describe("buildAwsCredentialsFile", () => {
   });
 });
 
-describe("buildPostBuildHook", () => {
+describe("buildUploadScript", () => {
   it("references the signing key, sets shell options, copies $OUT_PATHS", () => {
-    const hook = buildPostBuildHook({
+    const hook = buildUploadScript({
       bucket: "my-bucket",
       region: "auto",
       endpoint: "abc.r2.cloudflarestorage.com",
@@ -101,13 +101,17 @@ describe("buildPostBuildHook", () => {
     expect(hook).toContain(`secret-key=${SIGNING_KEY_PATH}`);
     expect(hook).toContain("compression=zstd");
     expect(hook).toContain("$OUT_PATHS");
+    // Pinned so the SDK doesn't depend on the caller's $HOME (macOS sudo).
+    expect(hook).toContain(
+      `export AWS_SHARED_CREDENTIALS_FILE=${awsCredentialsPath()}`,
+    );
     expect(hook).toContain(
       "s3://my-bucket?endpoint=abc.r2.cloudflarestorage.com&region=auto",
     );
   });
 
   it("retries nix copy with backoff instead of exec-ing it", () => {
-    const hook = buildPostBuildHook({
+    const hook = buildUploadScript({
       bucket: "my-bucket",
       region: "auto",
       endpoint: "abc.r2.cloudflarestorage.com",
