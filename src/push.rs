@@ -66,18 +66,18 @@ fn load_snapshot(path: &Path) -> Result<HashSet<StorePath>> {
 }
 
 pub async fn run(args: PushArgs) -> Result<()> {
-    // Refuse to run without our post-build hook installed. The hook is what
-    // signs and uploads each build's closure as it lands; without it, this
-    // binary would have to sign and push paths itself, and the in-process
-    // path doesn't do that today. Fail fast rather than silently uploading
-    // unsigned narinfos that clients will then reject.
+    // Refuse to run without our upload script installed as the post-build
+    // hook. It's what signs and uploads each build's closure as it lands, and
+    // we run it below to upload the closure root; this binary can't sign
+    // paths itself. Fail fast rather than silently uploading unsigned
+    // narinfos that clients will then reject.
     if !nix::our_post_build_hook_installed_real() {
         anyhow::bail!(
-            "post-build hook {} is not the active nix daemon's post-build-hook; \
-             nix-s3-generations relies on the hook to sign and upload paths. \
-             Run the action's main step (which installs the hook and restarts \
+            "upload script {} is not the active nix daemon's post-build-hook; \
+             nix-s3-generations relies on it to sign and upload paths. \
+             Run the action's main step (which installs it and restarts \
              the daemon) before invoking push.",
-            nix::OUR_POST_BUILD_HOOK_PATH,
+            nix::UPLOAD_SCRIPT_PATH,
         );
     }
 
@@ -110,19 +110,23 @@ pub async fn run(args: PushArgs) -> Result<()> {
         .await
         .context("failed to create S3 client")?;
 
-    tracing::info!(
-        cover = cover.len(),
-        "building closure root — the post-build-hook will also push its \
-         closure to the cache; expect this step to dominate runtime",
-    );
     let closure_root =
         nix::build_closure_root_real(&cover).context("failed to materialize closure root")?;
-    tracing::info!(%closure_root, "closure root built");
+    tracing::info!(%closure_root, "closure root created");
 
-    // The post-build hook just ran a recursive `nix copy --to` on the
-    // closure root. `nix copy` walks references-first (post-order), so if
-    // the closure root's narinfo is in the destination, every path in its
-    // closure is too. One HEAD beats re-walking 7000+ paths to confirm.
+    // The closure root isn't built, so the post-build hook never sees it.
+    // Upload it explicitly. The copy is recursive: locally-built paths were
+    // already pushed by the hook and get skipped, but substituted paths only
+    // reach the cache here.
+    tracing::info!(
+        cover = cover.len(),
+        "uploading closure root — expect this step to dominate runtime",
+    );
+    nix::upload_closure(&closure_root).context("failed to upload closure root")?;
+
+    // `nix copy` walks references-first (post-order), so if the closure
+    // root's narinfo is in the destination, every path in its closure is
+    // too. One HEAD beats re-walking 7000+ paths to confirm.
     let narinfo = s3_keys::narinfo_key(&closure_root)?;
     tracing::info!(narinfo = %narinfo, "verifying closure root narinfo on remote");
     if !s3_client
@@ -131,9 +135,9 @@ pub async fn run(args: PushArgs) -> Result<()> {
         .context("failed to HEAD closure root narinfo")?
     {
         anyhow::bail!(
-            "closure root narinfo {} missing on remote — post-build hook \
-             should have uploaded it. Treating as a cache invariant \
-             violation rather than papering over it with a recursive push",
+            "closure root narinfo {} missing on remote after a successful \
+             upload. Treating as a cache invariant violation rather than \
+             papering over it",
             narinfo
         );
     }

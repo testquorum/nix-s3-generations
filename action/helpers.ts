@@ -11,11 +11,11 @@ import {
 
 export const NIX_CONF_PATH = "/etc/nix/nix.conf";
 export const SIGNING_KEY_PATH = "/etc/nix/cache-priv-key.pem";
-// The path is unique to this action so the Rust binary can detect *our*
-// hook (not just any post-build-hook). Must stay in sync with
-// `OUR_POST_BUILD_HOOK_PATH` in src/nix.rs.
-export const POST_BUILD_HOOK_PATH =
-  "/etc/nix/nix-s3-generations-post-build-hook.sh";
+// Installed as the daemon's post-build-hook and also run directly by the
+// Rust binary to upload the closure root. The path is unique to this action
+// so the binary can detect *our* hook (not just any post-build-hook). Must
+// stay in sync with `UPLOAD_SCRIPT_PATH` in src/nix.rs.
+export const UPLOAD_SCRIPT_PATH = "/etc/nix/nix-s3-generations-upload.sh";
 
 /// Where the root-owned Nix daemon's AWS SDK looks for credentials: root's
 /// home. macOS keeps that at /var/root, and `/` is a read-only system volume
@@ -77,7 +77,7 @@ export function buildNixConf(cfg: NixCacheConfig): string {
     "# nix-s3-generations",
     `extra-substituters = s3://${cfg.bucket}?${s3Params}`,
     `extra-trusted-public-keys = ${cfg.publicKey}`,
-    `post-build-hook = ${POST_BUILD_HOOK_PATH}`,
+    `post-build-hook = ${UPLOAD_SCRIPT_PATH}`,
     "",
   ].join("\n");
 }
@@ -92,16 +92,20 @@ export function buildAwsCredentialsFile(creds: AwsCredentials): string {
   ].join("\n");
 }
 
-/// Post-build hook script. Runs as root via the Nix daemon after every
-/// successful build; signs and uploads each output path immediately.
-/// AWS credentials are picked up from root's ~/.aws/credentials by the SDK.
+/// Upload script: signs and uploads the closures of the space-separated
+/// paths in `$OUT_PATHS`. That's Nix's post-build-hook interface, so the
+/// daemon runs it as root after every successful build. `push` runs it the
+/// same way (`sudo env OUT_PATHS=…`) for the closure root, which isn't built
+/// and so never triggers the hook. Running as root keeps the signing key and
+/// AWS credentials (from root's ~/.aws/credentials) out of the runner user's
+/// reach, and keeps a single upload path.
 ///
 /// Retries `nix copy` with exponential backoff: the underlying AWS SDK
 /// occasionally aborts mid-transfer on flaky S3 responses (we've observed
 /// SIGABRT on the largest closures), and the surrounding `nix build` fails
 /// loudly when this hook returns non-zero. Retrying in-hook also covers the
 /// user's own build steps, not just our cleanup push.
-export function buildPostBuildHook(cfg: NixCacheConfig): string {
+export function buildUploadScript(cfg: NixCacheConfig): string {
   const s3Params = buildNixS3Params(cfg);
   const copyUri = `s3://${cfg.bucket}?${s3Params}&secret-key=${SIGNING_KEY_PATH}&compression=zstd`;
   return [
@@ -110,6 +114,11 @@ export function buildPostBuildHook(cfg: NixCacheConfig): string {
     "set -o pipefail",
     "",
     'echo "nix-s3-generations: uploading $OUT_PATHS"',
+    "",
+    // Point the SDK at the file we wrote rather than relying on $HOME: the
+    // daemon runs us with root's home, but macOS sudo keeps the caller's
+    // $HOME, which would send the SDK to the runner's (absent) credentials.
+    `export AWS_SHARED_CREDENTIALS_FILE=${awsCredentialsPath()}`,
     "",
     "NIX=/nix/var/nix/profiles/default/bin/nix",
     "MAX_ATTEMPTS=4",
@@ -173,8 +182,8 @@ export async function configureNixCache(
   await sudoWriteFile(SIGNING_KEY_PATH, signingKey, "0600");
   core.info(`Wrote signing key to ${SIGNING_KEY_PATH}`);
 
-  await sudoWriteFile(POST_BUILD_HOOK_PATH, buildPostBuildHook(cfg), "0755");
-  core.info(`Wrote post-build hook to ${POST_BUILD_HOOK_PATH}`);
+  await sudoWriteFile(UPLOAD_SCRIPT_PATH, buildUploadScript(cfg), "0755");
+  core.info(`Wrote upload script to ${UPLOAD_SCRIPT_PATH}`);
 
   // Append to /etc/nix/nix.conf so we don't clobber settings the Nix installer
   // already wrote (e.g. `experimental-features = nix-command flakes`).
@@ -256,7 +265,8 @@ export async function runPost(): Promise<void> {
 
   // The binary runs as the runner user — it can't read root's ~/.aws/credentials,
   // and inputs aren't visible to the AWS SDK. Forward the creds explicitly so
-  // both `nix copy` and the in-process S3 client can authenticate.
+  // the in-process S3 client can authenticate. (Uploads go through the
+  // root-owned upload script, which uses root's credentials.)
   const accessKeyId =
     core.getInput("aws-access-key-id") ||
     process.env["AWS_ACCESS_KEY_ID"] ||

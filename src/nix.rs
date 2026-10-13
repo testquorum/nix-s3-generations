@@ -206,21 +206,17 @@ pub fn minimal_closure_cover(
     cover
 }
 
-/// Build the Nix expression for the closure-root derivation. The output is a
-/// single text file listing the cover paths; Nix's reference scanner picks
-/// them up as runtime refs. `roots = map builtins.storePath paths` is the
-/// only mechanism that propagates string contexts to the .drv as build-time
-/// deps without re-importing (path literals would copy fresh; `nix store
-/// add-file` doesn't run the reference scanner).
+/// Build the Nix expression for the closure root: a text file listing the
+/// cover paths, written with `builtins.toFile`. `builtins.storePath` gives
+/// each path an opaque string context, and `toFile` records those as the
+/// file's references, so the result's closure is exactly the cover's joint
+/// closure.
 ///
-/// `/bin/sh` is bind-mounted into the sandbox by default on Linux, so we
-/// don't need bash. `echo` and `>` are shell builtins, so we don't need
-/// coreutils. The closure-root .drv's only build-time deps are the cover
-/// paths themselves.
-///
-/// `system = builtins.currentSystem` lets the Nix evaluator pick its own
-/// system rather than us hardcoding it Rust-side; available because we
-/// already eval with `--impure` (required for `builtins.storePath`).
+/// This deliberately isn't a derivation. A derivation would need the cover
+/// paths as inputs, and on Darwin the sandbox profile lists every input
+/// path; for a whole run's closure that blows past the sandbox's 64 KiB
+/// limit ("data object length … exceeds maximum (65535)"). `toFile` writes
+/// straight to the store with no builder and no sandbox, on every platform.
 fn closure_root_expr(paths: &[NixStorePath]) -> String {
     let path_strings = paths
         .iter()
@@ -229,20 +225,15 @@ fn closure_root_expr(paths: &[NixStorePath]) -> String {
         .join(" ");
     format!(
         r#"let paths = [ {path_strings} ];
-in builtins.derivation {{
-  name = "nix-s3-generations-closure-root";
-  system = builtins.currentSystem;
-  builder = "/bin/sh";
-  args = [ "-c" "echo ${{builtins.toString paths}} > $out" ];
-  roots = map builtins.storePath paths;
-}}
+in builtins.toFile "nix-s3-generations-closure-root"
+  (builtins.toString (map builtins.storePath paths))
 "#,
     )
 }
 
-/// Build a single Nix store path whose runtime references are the given
-/// (already-deduplicated) paths. A single `nix copy` of this output walks
-/// the joint closure exactly once.
+/// Create a single Nix store path whose references are the given
+/// (already-deduplicated) paths. A single `nix copy` of it walks the joint
+/// closure exactly once.
 pub fn build_closure_root<R: NixCommandRunner>(
     runner: &R,
     paths: &[NixStorePath],
@@ -251,39 +242,51 @@ pub fn build_closure_root<R: NixCommandRunner>(
     // `--impure` is required because the expression uses `builtins.storePath`,
     // which reads from the local store and is rejected in pure evaluation.
     let output = runner
-        .run_nix(&[
-            "build",
-            "--impure",
-            "--no-link",
-            "--print-out-paths",
-            "--expr",
-            &expr,
-        ])
-        .context("failed to build closure root")?;
+        .run_nix(&["eval", "--impure", "--raw", "--expr", &expr])
+        .context("failed to create closure root")?;
     let store_path = String::from_utf8(output.stdout)
-        .context("invalid utf8 from nix build")?
+        .context("invalid utf8 from nix eval")?
         .trim()
         .to_string();
-    NixStorePath::try_from(store_path).context("nix build did not return a valid /nix/store path")
+    NixStorePath::try_from(store_path).context("nix eval did not return a valid /nix/store path")
 }
 
-/// Path of the post-build-hook this action installs. Must match
-/// `POST_BUILD_HOOK_PATH` in `action/helpers.ts`. The path is intentionally
-/// unique so we detect *our* hook specifically and not, say, an unrelated
-/// hook a user has configured for other purposes.
-pub const OUR_POST_BUILD_HOOK_PATH: &str = "/etc/nix/nix-s3-generations-post-build-hook.sh";
+/// Path of the upload script this action installs as the daemon's
+/// post-build-hook. Must match `UPLOAD_SCRIPT_PATH` in `action/helpers.ts`.
+/// The path is intentionally unique so we detect *our* hook specifically and
+/// not, say, an unrelated hook a user has configured for other purposes.
+pub const UPLOAD_SCRIPT_PATH: &str = "/etc/nix/nix-s3-generations-upload.sh";
 
-/// Returns true if the active Nix daemon's `post-build-hook` is the one this
-/// action installs. Used purely to make logging accurate: when our hook is
-/// set, `nix build` triggers it on success and the hook uploads the build's
-/// closure, which can dominate the wall time of `nix build`.
+/// Returns true if the active Nix daemon's `post-build-hook` is our upload
+/// script, i.e. every build's closure is being uploaded as it lands.
 pub fn our_post_build_hook_installed<R: NixCommandRunner>(runner: &R) -> bool {
     runner
         .run_nix(&["config", "show", "post-build-hook"])
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == OUR_POST_BUILD_HOOK_PATH)
+        .map(|s| s.trim() == UPLOAD_SCRIPT_PATH)
         .unwrap_or(false)
+}
+
+/// Sign and upload `path`'s closure by running the upload script as root,
+/// the same way the daemon runs it as the post-build-hook. Root is where the
+/// signing key and AWS credentials live; `-n` makes sudo fail rather than
+/// prompt if it isn't passwordless. `-H` sets $HOME to root's: macOS sudo
+/// otherwise keeps the caller's, and Nix running as root then warns and
+/// ignores it. The script's output is passed through.
+pub fn upload_closure(path: &NixStorePath) -> Result<()> {
+    let status = Command::new("sudo")
+        .arg("-n")
+        .arg("-H")
+        .arg("env")
+        .arg(format!("OUT_PATHS={path}"))
+        .arg(UPLOAD_SCRIPT_PATH)
+        .status()
+        .context("failed to execute sudo")?;
+    if !status.success() {
+        anyhow::bail!("{UPLOAD_SCRIPT_PATH} failed for {path}: {status}");
+    }
+    Ok(())
 }
 
 /// Convenience wrapper using the real Nix runner.
@@ -457,19 +460,29 @@ mod tests {
     }
 
     #[test]
-    fn test_closure_root_expr_uses_storepath_for_roots() {
+    fn test_closure_root_expr_uses_tofile_with_storepath_context() {
         let expr = closure_root_expr(&[nsp("/nix/store/p1"), nsp("/nix/store/p2")]);
-        assert!(expr.contains(r#"name = "nix-s3-generations-closure-root""#));
-        // /bin/sh from the sandbox; no bash dep.
-        assert!(expr.contains(r#"builder = "/bin/sh""#));
         // Cover paths appear as quoted strings in the local `paths` list...
         assert!(expr.contains(r#"paths = [ "/nix/store/p1" "/nix/store/p2" ]"#));
-        // ...and are mapped through builtins.storePath for the `roots` attr,
-        // which is what attaches their string contexts to the .drv.
-        assert!(expr.contains("roots = map builtins.storePath paths"));
-        // The script writes the path list to $out so the runtime scanner
-        // turns them into runtime references.
-        assert!(expr.contains("echo ${builtins.toString paths} > $out"));
+        // ...and are mapped through builtins.storePath, whose string contexts
+        // toFile records as the file's references.
+        assert!(expr.contains(r#"builtins.toFile "nix-s3-generations-closure-root""#));
+        assert!(expr.contains("(builtins.toString (map builtins.storePath paths))"));
+        // Not a derivation: nothing to build, so no Darwin sandbox profile.
+        assert!(!expr.contains("derivation"));
+    }
+
+    #[test]
+    fn test_build_closure_root_evaluates_expr() {
+        let paths = [nsp("/nix/store/p1")];
+        let expr = closure_root_expr(&paths);
+        let runner = MockRunner::success("/nix/store/abc-nix-s3-generations-closure-root")
+            .with_expected_args(&["eval", "--impure", "--raw", "--expr", &expr]);
+        let root = build_closure_root(&runner, &paths).unwrap();
+        assert_eq!(
+            root.as_str(),
+            "/nix/store/abc-nix-s3-generations-closure-root"
+        );
     }
 
     #[test]
@@ -544,7 +557,7 @@ mod tests {
 
     #[test]
     fn test_our_post_build_hook_installed_matches_exact_path() {
-        let runner = MockRunner::success(&format!("{}\n", OUR_POST_BUILD_HOOK_PATH))
+        let runner = MockRunner::success(&format!("{}\n", UPLOAD_SCRIPT_PATH))
             .with_expected_args(&["config", "show", "post-build-hook"]);
         assert!(our_post_build_hook_installed(&runner));
     }
